@@ -1,0 +1,80 @@
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+import requests
+from agents.ai_news_agent import get_ai_news_digest
+
+CONFIG_FILE = Path("/Users/eugene/Agents/supervisoragent/ai_news_config.json")
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+
+def load_config():
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {
+        "enabled": True,
+        "daily_push_time": "09:00",
+        "timezone": "Asia/Singapore",
+        "last_sent_date": ""
+    }
+
+
+def save_config(config):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+
+def send_telegram_message(text):
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+    if not TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_CHAT_ID is not set")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text
+    }
+
+    response = requests.post(url, json=payload, timeout=30)
+    response.raise_for_status()
+
+
+def main():
+    config = load_config()
+
+    if not config.get("enabled", True):
+        print("AI news push disabled")
+        return
+
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+
+    target = config.get("daily_push_time", "09:00")
+    target_time = datetime.strptime(target, "%H:%M").time()
+
+    if now.hour != target_time.hour or now.minute != target_time.minute:
+        print(f"Not time yet. Current: {now.strftime('%H:%M')}, target: {target}")
+        return
+
+    if config.get("last_sent_date") == today:
+        print("Already sent today")
+        return
+
+    digest = get_ai_news_digest()
+    send_telegram_message("Daily AI News Digest\n\n" + digest)
+
+    config["last_sent_date"] = today
+    save_config(config)
+
+    print("AI news digest sent")
+
+
+if __name__ == "__main__":
+    main()

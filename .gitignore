@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Cursor
+.cursor/
+
+# API keys and local config
+ai_news_push.env
+config.local.json
+secrets.json
+
+# launchd / runtime
+*.pid
+*.lock
+
+# Python (packaging, wheels, test/coverage caches)
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# macOS (metadata / resource forks)
+.AppleDouble
+.LSOverride
+.localized
+
+# Logs (rotated / suffixed)
+*.log.*
+
+# Environment (un-ignore common committed templates)
+!.env.example
+
+# API keys / credentials (extra filenames)
+.secrets/
+credentials.json
+
+# Editors (JetBrains, VS Code, Vim)
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

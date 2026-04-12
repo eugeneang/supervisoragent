@@ -1,0 +1,50 @@
+{
+  "eugene": {
+    "profile": {
+      "name": "Eugene",
+      "location": "Singapore",
+      "preferred_language": "English"
+    },
+    "facts": {
+      "favorite_cuisine": "Japanese, Korean, Thai, Local",
+      "restaurant_preference": "above_4.5_stars",
+      "usual_dining_area": "Punggol",
+      "common_eating_location": "Geylang Bahru Market"
+    },
+    "notes": [
+      "Building a WhatsApp-based family assistant",
+      "Prefers local models on Mac mini",
+      {
+        "time_of_day": "today",
+        "meal_suggestion": "dinner"
+      }
+    ]
+  },
+  "whatsapp:+6598807621": {
+    "profile": {},
+    "facts": {},
+    "notes": []
+  },
+  "telegram:296308596": {
+    "profile": {},
+    "facts": {
+      "sleep_pattern": "poor"
+    },
+    "notes": [
+      "Us bombing iran",
+      "iran war",
+      "feeling down",
+      {
+        "time": "9am",
+        "date": "tmr",
+        "type": "meeting"
+      },
+      "needs more sleep",
+      "sleep:5hours",
+      {
+        "time": "630am",
+        "issue": "alarm effectiveness"
+      }
+    ]
+  }
+}
