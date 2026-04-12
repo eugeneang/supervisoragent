@@ -24,6 +24,9 @@ logs/
 ai_news_push.env
 config.local.json
 secrets.json
+conversation_store.json
+structured_memory.json
+whitelist.json
 
 # launchd / runtime
 *.pid
@@ -67,3 +70,32 @@ credentials.json
 *.swp
 *.swo
 *~
+
+# Cursor project files
+.cursorignore
+.cursorindex
+
+# Python runtime files
+*.sqlite
+*.db
+
+# Launchd / macOS automation
+launchd/*.log
+
+# Local AI / model outputs
+*.cache
+.cache/
+
+# Temporary files
+tmp/
+temp/
+
+# Node (in case Cursor adds tooling)
+node_modules/
+
+# Python virtual env alt names
+env/
+ENV/
+
+# macOS Python temp
+.python-version
