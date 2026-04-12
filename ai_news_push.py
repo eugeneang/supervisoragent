@@ -65,7 +65,6 @@ def resolve_timezone(name: str) -> ZoneInfo:
 def parse_daily_push_time(target_raw: str) -> time:
     """
     Accepts '09:00', '9:00', optional surrounding whitespace.
-    Does not accept seconds (keeps config simple).
     """
     s = target_raw.strip()
     m = re.match(r"^(\d{1,2}):(\d{2})$", s)
@@ -81,24 +80,46 @@ def time_to_minutes(t: time) -> int:
     return t.hour * 60 + t.minute
 
 
-def should_send_scheduled(
-    now_local: datetime, target_t: time, last_sent_date: str, today_str: str
-) -> tuple[bool, str]:
+def after_or_at_push_time(now_local: datetime, target_t: time) -> tuple[bool, str]:
     """
-    Once per calendar day in config TZ: send on the first run at or after
-    daily_push_time (catch-up if the Mac slept through the exact minute).
+    True when wall-clock time in now_local's zone is at or after daily_push_time
+    (first eligible run that day; works with launchd every few minutes).
     """
-    if last_sent_date == today_str:
-        return False, "already_sent_today"
-
-    # Wall-clock time in the configured zone (naive time components match target_t).
     now_t = now_local.time()
     now_m = time_to_minutes(now_t)
     tgt_m = time_to_minutes(target_t)
     if now_m < tgt_m:
         return False, "before_push_time"
+    return True, "at_or_after_push_time"
 
-    return True, "scheduled_window_ok"
+
+def should_send_now(config: dict, now: datetime, force: bool) -> bool:
+    """
+    Whether the schedule allows sending now. When force is True, always True.
+    `now` must be timezone-aware (config timezone).
+    """
+    if force:
+        LOG.info("should_send_now: force=True (schedule bypassed)")
+        return True
+
+    target_raw = str(config.get("daily_push_time", "09:00")).strip()
+    try:
+        target_t = parse_daily_push_time(target_raw)
+    except ValueError as e:
+        raise RuntimeError(
+            f"Invalid daily_push_time format in config: {target_raw!r}. "
+            "Use HH:MM, e.g. 09:00 or 9:00"
+        ) from e
+
+    ok, reason = after_or_at_push_time(now, target_t)
+    LOG.info(
+        "should_send_now: now=%s target=%s -> %s (%s)",
+        now.strftime("%H:%M"),
+        target_t.strftime("%H:%M"),
+        ok,
+        reason,
+    )
+    return ok
 
 
 def send_telegram_message(text: str) -> None:
@@ -109,7 +130,11 @@ def send_telegram_message(text: str) -> None:
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-    LOG.debug("POST %s (chat_id=%s, text_len=%d)", url, TELEGRAM_CHAT_ID, len(text))
+    LOG.debug(
+        "POST Telegram sendMessage chat_id=%s text_len=%d",
+        TELEGRAM_CHAT_ID,
+        len(text),
+    )
 
     try:
         response = requests.post(url, json=payload, timeout=30)
@@ -144,9 +169,15 @@ def main() -> None:
     setup_logging()
     parser = argparse.ArgumentParser(description="Daily AI news digest → Telegram")
     parser.add_argument(
+        "--force",
         "--send-now",
         action="store_true",
-        help="Send digest immediately (ignores time window; does not update last_sent_date).",
+        help="Bypass disabled flag, 'already sent today', and schedule; still sends for real unless --dry-run.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build digest and print it; do not call Telegram or update last_sent_date.",
     )
     args = parser.parse_args()
 
@@ -154,61 +185,52 @@ def main() -> None:
     tz = resolve_timezone(config.get("timezone", "UTC"))
     now = datetime.now(tz)
     today = now.strftime("%Y-%m-%d")
-
-    target_raw = config.get("daily_push_time", "09:00")
-    try:
-        target_t = parse_daily_push_time(str(target_raw))
-    except ValueError as e:
-        LOG.error("Invalid daily_push_time in config: %s (%s)", target_raw, e)
-        raise RuntimeError(
-            f"Invalid daily_push_time format in config: {target_raw!r}. Use HH:MM, e.g. 09:00 or 9:00"
-        ) from e
+    force = bool(args.force)
+    dry_run = bool(args.dry_run)
 
     last_sent = (config.get("last_sent_date") or "").strip()
 
     LOG.info(
-        "Run start: now=%s (%s) today=%s target=%s last_sent_date=%r send_now=%s enabled=%s",
+        "Run start: now=%s (%s) today=%s last_sent_date=%r force=%s dry_run=%s enabled=%s",
         now.isoformat(),
         tz.key,
         today,
-        target_raw,
         last_sent,
-        args.send_now,
+        force,
+        dry_run,
         config.get("enabled", True),
     )
 
-    if not config.get("enabled", True):
+    if not config.get("enabled", True) and not force:
         LOG.info("AI news push disabled in config; exiting")
         return
 
-    if args.send_now:
-        LOG.info("Manual --send-now: bypassing schedule and last_sent_date checks")
-    else:
-        ok, reason = should_send_scheduled(now, target_t, last_sent, today)
-        LOG.info(
-            "Schedule check: should_send=%s reason=%s (now_time=%s target=%s)",
-            ok,
-            reason,
-            now.strftime("%H:%M"),
-            target_raw,
-        )
-        if not ok:
+    if last_sent == today and not force:
+        if dry_run:
+            LOG.info("Dry-run: bypassing already-sent-today check")
+        else:
+            LOG.info("Already sent today")
             return
+
+    if not should_send_now(config, now, force):
+        LOG.info("Not within scheduled window")
+        return
 
     try:
         LOG.info("Building digest via get_ai_news_digest() …")
         digest = get_ai_news_digest()
+        message = "Daily AI News Digest\n\n" + digest
         LOG.info("Digest ready, length=%d chars", len(digest))
-        send_telegram_message("Daily AI News Digest\n\n" + digest)
 
-        if not args.send_now:
-            config["last_sent_date"] = today
-            save_config(config)
-            LOG.info("Saved last_sent_date=%s", today)
-        else:
-            LOG.info("--send-now: not updating last_sent_date (scheduled push unchanged)")
+        if dry_run:
+            print(message)
+            LOG.info("Dry-run: printed digest to stdout; no Telegram, no last_sent_date update")
+            return
 
-        LOG.info("AI news digest sent successfully")
+        send_telegram_message(message)
+        config["last_sent_date"] = today
+        save_config(config)
+        LOG.info("AI news digest sent; last_sent_date=%s", today)
     except Exception as e:
         LOG.exception("Failed to send AI news digest: %s", e)
         raise

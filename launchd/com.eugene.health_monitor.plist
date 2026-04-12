@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.eugene.health_monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>--noprofile</string>
+        <string>--norc</string>
+        <string>-c</string>
+        <string>set -a; source &quot;/Users/eugene/Agents/supervisoragent/ai_news_push.env&quot;; set +a; exec &quot;/Users/eugene/Agents/supervisoragent/start_health_monitor.sh&quot;</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/eugene/Agents/supervisoragent</string>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/eugene/Agents/health_monitor.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/eugene/Agents/health_monitor.error.log</string>
+</dict>
+</plist>
