@@ -33,3 +33,23 @@ jobs:
       - name: Run Python syntax checks
         run: |
           python -m py_compile telegram_bot.py ai_news_push.py local_chat.py whatsapp_app.py
+
+  notify-ci-failed-main:
+    name: Notify Telegram (CI failed on main)
+    needs: [python-checks]
+    if: failure() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Send Telegram alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: python3 .github/scripts/telegram_notify.py ci-failed-main
