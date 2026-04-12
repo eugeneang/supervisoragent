@@ -9,7 +9,7 @@ import ollama
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 WHITELIST_FILE = Path("whitelist.json")
 AUTO_WHITELIST_LIMIT = 2
