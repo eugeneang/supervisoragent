@@ -1,0 +1,43 @@
+name: Auto Rollback on CI Failure
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  rollback:
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Revert failed commit
+        run: |
+          FAILED_SHA="${{ github.event.workflow_run.head_sha }}"
+          COMMIT_MSG="$(git log -1 --pretty=%s "$FAILED_SHA")"
+          echo "Failed SHA: $FAILED_SHA"
+          echo "Commit: $COMMIT_MSG"
+
+          if echo "$COMMIT_MSG" | grep -qi "^revert"; then
+            echo "Failed commit is already a revert. Skipping."
+            exit 0
+          fi
+
+          git revert --no-edit "$FAILED_SHA"
+          git push origin main
