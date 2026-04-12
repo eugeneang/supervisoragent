@@ -99,3 +99,10 @@ ENV/
 
 # macOS Python temp
 .python-version
+
+# Secrets
+*.pem
+*.key
+*.crt
+*.env.local
+*.env.dev
