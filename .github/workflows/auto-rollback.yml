@@ -1,3 +1,5 @@
+# Reverts the commit that failed CI on main, then pushes the revert.
+# Triggered only after the "CI" workflow completes with failure.
 name: Auto Rollback on CI Failure
 
 on:
@@ -5,8 +7,13 @@ on:
     workflows: ["CI"]
     types: [completed]
 
+concurrency:
+  group: auto-rollback-main
+  cancel-in-progress: false
+
 permissions:
   contents: write
+  issues: write
 
 jobs:
   rollback:
@@ -16,28 +23,127 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout main
+      - name: Checkout main (full history)
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
 
-      - name: Configure git
+      - name: Configure git (github-actions bot)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Revert failed commit
+      - name: Sync, validate, revert or open issue
+        env:
+          FAILED_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          FAILED_SHA="${{ github.event.workflow_run.head_sha }}"
-          COMMIT_MSG="$(git log -1 --pretty=%s "$FAILED_SHA")"
-          echo "Failed SHA: $FAILED_SHA"
-          echo "Commit: $COMMIT_MSG"
+          set -euo pipefail
 
-          if echo "$COMMIT_MSG" | grep -qi "^revert"; then
-            echo "Failed commit is already a revert. Skipping."
+          echo "Triggering workflow run: ${WORKFLOW_RUN_URL}"
+          echo "Failed run conclusion: ${{ github.event.workflow_run.conclusion }}"
+          echo "Head branch: ${{ github.event.workflow_run.head_branch }}"
+          echo "Failed commit SHA: ${FAILED_SHA}"
+
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+
+          if ! git cat-file -e "${FAILED_SHA}^{commit}" 2>/dev/null; then
+            echo "SHA is not a valid commit. Skipping."
             exit 0
           fi
 
-          git revert --no-edit "$FAILED_SHA"
-          git push origin main
+          if ! git merge-base --is-ancestor "${FAILED_SHA}" HEAD; then
+            echo "Failed SHA is not an ancestor of main (e.g. branch was reset). Skipping revert."
+            exit 0
+          fi
+
+          SUBJECT="$(git log -1 --pretty=%s "${FAILED_SHA}")"
+          FULL_MSG="$(git log -1 --pretty=format:%B "${FAILED_SHA}")"
+          echo "Failed commit subject: ${SUBJECT}"
+
+          if echo "${FULL_MSG}" | grep -Fq '[no-rollback]'; then
+            echo "Skipping: commit message contains [no-rollback]."
+            exit 0
+          fi
+
+          # Avoid loops: skip if subject looks like `git revert` output (starts with Revert + space)
+          if [[ "${SUBJECT}" =~ ^[Rr]evert\  ]]; then
+            echo "Failed commit looks like a revert. Skipping auto-revert to avoid chains."
+            exit 0
+          fi
+
+          echo "Reverting ${FAILED_SHA} with git revert --no-edit ..."
+          if git revert --no-edit "${FAILED_SHA}"; then
+            git push origin main
+            echo "Revert pushed to main."
+            exit 0
+          fi
+
+          echo "git revert failed; creating GitHub issue for manual follow-up."
+          git log -1 --pretty=format:%B "${FAILED_SHA}" > /tmp/failed_commit_fullmsg.txt
+          export ISSUE_SHA="${FAILED_SHA}"
+          export ISSUE_SUBJECT="${SUBJECT}"
+          export ISSUE_WORKFLOW_URL="${WORKFLOW_RUN_URL}"
+          python3 << 'PY'
+          import json
+          import os
+          import textwrap
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          sha = os.environ["ISSUE_SHA"]
+          subject = os.environ["ISSUE_SUBJECT"]
+          full_msg = Path("/tmp/failed_commit_fullmsg.txt").read_text(encoding="utf-8")
+          run_url = os.environ.get("ISSUE_WORKFLOW_URL", "(not available)")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GITHUB_TOKEN"]
+          api = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+
+          title = f"Auto-rollback failed: could not revert {sha[:7]}"
+
+          fence = "~~~~" if "```" in full_msg else "```"
+          body = textwrap.dedent(
+              f"""
+              ## Auto-rollback could not complete
+
+              The workflow tried to revert the commit that failed CI on `main`, but **`git revert` failed** (often merge conflicts or a dirty history). Please revert manually or fix `main` as needed.
+
+              ### Failed commit
+              - **SHA:** `{sha}`
+              - **Subject:** {subject}
+              - **Failed CI workflow run:** {run_url}
+
+              ### Full commit message
+              {fence}
+              {full_msg.rstrip()}
+              {fence}
+              """
+          ).strip()
+
+          payload = json.dumps({"title": title, "body": body}).encode("utf-8")
+          req = urllib.request.Request(
+              f"{api}/repos/{repo}/issues",
+              data=payload,
+              method="POST",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "Content-Type": "application/json",
+              },
+          )
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  out = json.loads(resp.read().decode())
+                  print(f"Created issue #{out.get('number')}: {out.get('html_url')}")
+          except urllib.error.HTTPError as e:
+              print(e.read().decode())
+              raise SystemExit(1) from e
+          PY
+
+          exit 1
