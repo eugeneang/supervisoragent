@@ -1,0 +1,4 @@
+python-telegram-bot
+ollama
+requests
+ddgs
