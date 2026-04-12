@@ -1,4 +1,3 @@
-this is not valid python
 import argparse
 import json
 import logging
