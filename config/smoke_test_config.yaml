@@ -1,0 +1,23 @@
+# Telegram Bot Smoke Test Configuration
+# ----------------------------------------
+# smoke_bot_token and smoke_chat_id MUST be provided via environment variables
+# (SMOKE_BOT_TOKEN and SMOKE_CHAT_ID) or filled in below.
+#
+# Use a SEPARATE bot token from your production bot so test traffic is isolated.
+# Run @BotFather on Telegram to create a dedicated test bot.
+
+# smoke_bot_token: "123456:ABC-YOUR-TEST-BOT-TOKEN"  # override with SMOKE_BOT_TOKEN env var
+# smoke_chat_id: 0                                    # override with SMOKE_CHAT_ID env var
+
+# How long (seconds) to wait for a response per command (default, can be
+# overridden per-command in command_registry.py).
+timeout_seconds: 15
+
+# Maximum number of retry attempts per command before marking it as failed.
+retry_attempts: 3
+
+# Seconds between update polling iterations.
+poll_interval: 1.5
+
+# Long-poll timeout sent to Telegram getUpdates API (seconds).
+poll_timeout: 30
