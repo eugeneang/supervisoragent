@@ -1,31 +1,24 @@
 #!/bin/bash
 # start_telegram_bot.sh — Start the Telegram supervisor bot.
-# Follows the same env-loading pattern as start_ai_news_push.sh.
-# Both read from ai_news_push.env, which is the shared secret store for all
-# supervisor services. Add ANTHROPIC_API_KEY there if it is not already set.
+# Loads secrets from ai_news_push.env (shared secret store for all supervisor
+# services). Works identically whether invoked manually or via launchd.
 set -euo pipefail
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/ai_news_push.env"
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
-cd "$ROOT" || exit 1
-
-ENV_FILE="$ROOT/ai_news_push.env"
-if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-  if [ ! -f "$ENV_FILE" ]; then
-    echo "telegram_bot: create $ENV_FILE with TELEGRAM_BOT_TOKEN and ANTHROPIC_API_KEY" >&2
-    exit 1
-  fi
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
-fi
-
-if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-  echo "telegram_bot: TELEGRAM_BOT_TOKEN still empty after sourcing env" >&2
+if [ ! -f "$ENV_FILE" ]; then
+  echo "ERROR: env file not found: $ENV_FILE" >&2
+  echo "       Copy ai_news_push.env.example to ai_news_push.env and fill in the secrets." >&2
   exit 1
 fi
 
-source .venv/bin/activate
-exec python telegram_bot.py "$@"
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
+
+: "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is not set in $ENV_FILE}"
+: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is not set in $ENV_FILE}"
+
+exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/telegram_bot.py"
