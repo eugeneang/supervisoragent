@@ -32,6 +32,9 @@ whitelist.json
 *.pid
 *.lock
 
+# Supervisor loop runtime state
+supervisor_state.json
+
 # Python (packaging, wheels, test/coverage caches)
 *.egg
 *.egg-info/

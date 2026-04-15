@@ -6,10 +6,20 @@ import sys
 from agents.ai_news_agent import get_ai_news_digest
 
 import ollama
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+from supervisor_loop import SupervisorLoop
 
 from ddgs import DDGS
+
+supervisor = SupervisorLoop()
 
 WHITELIST_FILE = Path("whitelist.json")
 AUTO_WHITELIST_LIMIT = 2
@@ -46,7 +56,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/id - show your Telegram user ID\n"
         "/status - system status (coming soon)\n"
         "/security - latest hardening summary (coming soon)\n"
-        "/travel - travel planner (coming soon)"
+        "/travel - travel planner (coming soon)\n\n"
+        "Coding loop:\n"
+        "/design <request> - generate a design proposal\n"
+        "/approve - approve the pending proposal and build\n"
+        "/reject [reason] - reject and reset\n"
+        "/build_status - show current loop state\n"
+        "/reset_build - force-reset stuck DESIGNING/BUILDING state to IDLE"
     )
     await update.message.reply_text(help_text)
 
@@ -297,6 +313,97 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error: {str(e)}")
         logger.exception("Error while handling Telegram message")
 
+async def design_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("Sorry, you are not authorized.")
+        return
+    request_text = " ".join(context.args).strip() if context.args else ""
+    if not request_text:
+        await update.message.reply_text("Usage: /design <your feature request>")
+        return
+    await update.message.reply_text("Generating design proposal... ⏳")
+    proposal_text, status_msg = await supervisor.start_design(
+        update.effective_chat.id, request_text
+    )
+    if proposal_text is None:
+        await update.message.reply_text(status_msg)
+        return
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data="approve"),
+        InlineKeyboardButton("❌ Reject", callback_data="reject"),
+    ]])
+    await update.message.reply_text(proposal_text, reply_markup=keyboard)
+
+
+async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("Sorry, you are not authorized.")
+        return
+    chat_id = update.effective_chat.id
+
+    async def notify(msg: str):
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+
+    reply = await supervisor.approve(chat_id, notify)
+    await update.message.reply_text(reply)
+
+
+async def reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("Sorry, you are not authorized.")
+        return
+    reason = " ".join(context.args).strip() if context.args else ""
+    await update.message.reply_text(supervisor.reject(reason))
+
+
+async def build_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("Sorry, you are not authorized.")
+        return
+    await update.message.reply_text(supervisor.get_status())
+
+
+async def reset_build_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("Sorry, you are not authorized.")
+        return
+    await update.message.reply_text(supervisor.force_reset())
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+    if not is_user_allowed(update.effective_user.id):
+        await query.answer("Not authorized.")
+        return
+    await query.answer()  # removes the loading spinner on the button
+    chat_id = query.message.chat.id
+    data = query.data or ""
+
+    if data == "approve":
+        async def notify(msg: str):
+            await context.bot.send_message(chat_id=chat_id, text=msg)
+        reply = await supervisor.approve(chat_id, notify)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+
+    elif data == "reject":
+        reply = supervisor.reject()
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+
+
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -309,6 +416,14 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("ai", ai_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Supervisor coding loop
+    app.add_handler(CommandHandler("design", design_command))
+    app.add_handler(CommandHandler("approve", approve_command))
+    app.add_handler(CommandHandler("reject", reject_command))
+    app.add_handler(CommandHandler("build_status", build_status_command))
+    app.add_handler(CommandHandler("reset_build", reset_build_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
 
     logger.info("Telegram bot is running...")
     app.run_polling()

@@ -1,0 +1,12 @@
+{
+  "state": "DESIGNING",
+  "requester_chat_id": 296308596,
+  "request_text": "add a /ping command that replies with “pong”",
+  "proposal_text": null,
+  "feature_name": null,
+  "changed_files": [],
+  "build_summary": null,
+  "error": null,
+  "created_at": "2026-04-14T17:37:54.123756+00:00",
+  "updated_at": "2026-04-14T17:37:54.123771+00:00"
+}
