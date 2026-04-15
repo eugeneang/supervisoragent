@@ -55,16 +55,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - show command list\n"
         "/ping - check if the bot is alive\n"
         "/ai - latest AI news summary\n"
-        "/id - show your Telegram user ID\n"
-        "/status - system status (coming soon)\n"
-        "/security - latest hardening summary (coming soon)\n"
-        "/travel - travel planner (coming soon)\n\n"
+        "/id - show your Telegram user ID\n\n"
         "Coding loop:\n"
         "/design <request> - generate a design proposal\n"
-        "/approve - approve the pending proposal and build\n"
-        "/reject [reason] - reject and reset\n"
-        "/build_status - show current loop state\n"
-        "/reset_build - force-reset stuck DESIGNING/BUILDING state to IDLE"
+        "/approve - approve the pending proposal and start build\n"
+        "/reject [reason] - reject/rollback and reset to IDLE\n"
+        "/build_status - show current loop state and timestamps\n"
+        "/reset_build - force-reset stuck state to IDLE\n\n"
+        "After a build completes you will see inline buttons:\n"
+        "  ✅ Commit & Push — commit, push, and restart services\n"
+        "  ❌ Rollback Build — revert all build file changes"
     )
     await update.message.reply_text(help_text)
 
@@ -339,6 +339,27 @@ async def design_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(proposal_text, reply_markup=keyboard)
 
 
+def _commit_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard shown after a successful build."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Commit & Push", callback_data="approve_commit"),
+        InlineKeyboardButton("❌ Rollback Build", callback_data="reject_commit"),
+    ]])
+
+
+def _make_notify(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """
+    Return a notify coroutine that automatically attaches the commit approval
+    keyboard when the supervisor is in AWAITING_COMMIT_APPROVAL state.
+    Keeps Telegram UI concerns out of supervisor_loop.py.
+    """
+    async def notify(msg: str) -> None:
+        state = supervisor.load_state().get("state")
+        markup = _commit_keyboard() if state == "AWAITING_COMMIT_APPROVAL" else None
+        await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=markup)
+    return notify
+
+
 async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message:
         return
@@ -346,11 +367,7 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sorry, you are not authorized.")
         return
     chat_id = update.effective_chat.id
-
-    async def notify(msg: str):
-        await context.bot.send_message(chat_id=chat_id, text=msg)
-
-    reply = await supervisor.approve(chat_id, notify)
+    reply = await supervisor.approve(chat_id, _make_notify(context, chat_id))
     await update.message.reply_text(reply)
 
 
@@ -394,14 +411,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
 
     if data == "approve":
-        async def notify(msg: str):
-            await context.bot.send_message(chat_id=chat_id, text=msg)
-        reply = await supervisor.approve(chat_id, notify)
+        reply = await supervisor.approve(chat_id, _make_notify(context, chat_id))
         await query.edit_message_reply_markup(reply_markup=None)
         await context.bot.send_message(chat_id=chat_id, text=reply)
 
     elif data == "reject":
         reply = supervisor.reject()
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+
+    elif data == "approve_commit":
+        reply = await supervisor.approve_commit(_make_notify(context, chat_id))
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+
+    elif data == "reject_commit":
+        reply = supervisor.reject_commit()
         await query.edit_message_reply_markup(reply_markup=None)
         await context.bot.send_message(chat_id=chat_id, text=reply)
 

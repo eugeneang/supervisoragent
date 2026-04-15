@@ -16,6 +16,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,6 +31,9 @@ REPO_ROOT = Path(__file__).parent.resolve()
 # Timeout constants (seconds)
 DESIGN_TIMEOUT = 120.0   # max time for proposal generation
 BUILD_TIMEOUT = 300.0    # max time for code generation + file writes
+# Retry once for transient upstream Anthropic/API failures.
+_RETRYABLE_STATUS = frozenset({500, 502, 503, 529})
+_RETRY_DELAY = 2.0
 
 # Files the build step must never overwrite
 _PROTECTED_FILES = frozenset({
@@ -43,6 +48,127 @@ _PROTECTED_FILES = frozenset({
 })
 _PROTECTED_PREFIXES = (".github/", "launchd/")
 
+
+def _extract_status_code(exc: Exception) -> int | None:
+    """
+    Best-effort extraction of HTTP status code from Anthropic/HTTP/client exceptions.
+    """
+    for attr in ("status_code", "status", "http_status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        for attr in ("status_code", "status"):
+            value = getattr(response, attr, None)
+            if isinstance(value, int):
+                return value
+
+    text = str(exc)
+    match = re.search(r"\b(500|502|503|529)\b", text)
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+def _extract_request_id(exc: Exception) -> str | None:
+    """
+    Best-effort extraction of Anthropic request_id from exception fields or message text.
+    """
+    for attr in ("request_id",):
+        value = getattr(exc, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        # Some SDKs may expose headers or request IDs through response objects.
+        headers = getattr(response, "headers", None)
+        if headers:
+            for key in ("request-id", "x-request-id", "anthropic-request-id"):
+                value = headers.get(key) or headers.get(key.upper())
+                if value:
+                    return str(value).strip()
+
+        for attr in ("request_id",):
+            value = getattr(response, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    text = str(exc)
+    match = re.search(r"request_id[\"'=:\s]+([A-Za-z0-9_\-]+)", text)
+    if match:
+        return match.group(1).strip()
+
+    # Matches things like req_011Ca5kU4hnjG1ZxKf3o1YXy
+    match = re.search(r"\b(req_[A-Za-z0-9]+)\b", text)
+    if match:
+        return match.group(1).strip()
+
+    return None
+
+
+def _is_retryable_anthropic_error(exc: Exception) -> bool:
+    status = _extract_status_code(exc)
+    return status in _RETRYABLE_STATUS
+
+
+def _format_api_error(exc: Exception) -> str:
+    """
+    Build a user-visible error string preserving request ID and status code when available.
+    """
+    status = _extract_status_code(exc)
+    request_id = _extract_request_id(exc)
+    message = str(exc).strip() or exc.__class__.__name__
+
+    parts = ["Anthropic API error"]
+    if status is not None:
+        parts.append(f"status={status}")
+    if request_id:
+        parts.append(f"request_id={request_id}")
+
+    prefix = " ".join(parts)
+    return f"{prefix}: {message}"
+
+
+def _call_api(fn, *args, **kwargs):
+    """
+    Execute an Anthropic API call with one retry for transient upstream failures.
+    Intended to run inside asyncio.to_thread(...), so blocking sleep is acceptable.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        if not _is_retryable_anthropic_error(exc):
+            raise
+
+        status = _extract_status_code(exc)
+        request_id = _extract_request_id(exc)
+        logging.warning(
+            "Anthropic API transient failure on first attempt; retrying once. "
+            "status=%s request_id=%s error=%s",
+            status,
+            request_id,
+            exc,
+        )
+
+        time.sleep(_RETRY_DELAY)
+
+        try:
+            return fn(*args, **kwargs)
+        except Exception as retry_exc:
+            retry_status = _extract_status_code(retry_exc)
+            retry_request_id = _extract_request_id(retry_exc)
+            logging.error(
+                "Anthropic API failed after retry. "
+                "status=%s request_id=%s error=%s",
+                retry_status,
+                retry_request_id,
+                retry_exc,
+            )
+            raise RuntimeError(_format_api_error(retry_exc)) from retry_exc
 
 @dataclass
 class ProposalResult:
