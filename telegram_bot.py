@@ -16,6 +16,7 @@ from telegram.ext import (
     filters,
 )
 from supervisor_loop import SupervisorLoop
+from commands.ping import ping_command
 
 from ddgs import DDGS
 
@@ -52,6 +53,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "Available commands:\n\n"
         "/help - show command list\n"
+        "/ping - check if the bot is alive\n"
         "/ai - latest AI news summary\n"
         "/id - show your Telegram user ID\n"
         "/status - system status (coming soon)\n"
@@ -414,6 +416,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("ai", ai_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
