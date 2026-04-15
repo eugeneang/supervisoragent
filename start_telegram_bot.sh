@@ -22,14 +22,9 @@ if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${ANTHROPIC_API_KEY:-}" ]; then
   set +a
 fi
 
-if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${ANTHROPIC_API_KEY:-}" ]; then
   echo "telegram_bot: TELEGRAM_BOT_TOKEN still empty after sourcing env" >&2
   exit 1
-fi
-
-if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-  echo "telegram_bot: ANTHROPIC_API_KEY not set — /design and /approve will fail" >&2
-  # Non-fatal: Ollama-based features still work without this key.
 fi
 
 source .venv/bin/activate
