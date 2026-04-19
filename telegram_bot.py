@@ -1,12 +1,14 @@
 import json
 import os
+import sys
 from pathlib import Path
 import logging
-import sys
+
 from agents.ai_news_agent import get_ai_news_digest
 
 import ollama
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict as TelegramConflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -17,6 +19,7 @@ from telegram.ext import (
 )
 from supervisor_loop import SupervisorLoop
 from commands.ping import ping_command
+from commands.recap import recap_handler
 
 from ddgs import DDGS
 
@@ -55,7 +58,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - show command list\n"
         "/ping - check if the bot is alive\n"
         "/ai - latest AI news summary\n"
-        "/id - show your Telegram user ID\n\n"
+        "/id - show your Telegram user ID\n"
+        "/recap - daily activity summary\n\n"
         "Coding loop:\n"
         "/design <request> - generate a design proposal\n"
         "/approve - approve the pending proposal and start build\n"
@@ -340,24 +344,51 @@ async def design_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _commit_keyboard() -> InlineKeyboardMarkup:
-    """Inline keyboard shown after a successful build."""
+    """Inline keyboard shown after a successful build + passing tests."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Commit & Push", callback_data="approve_commit"),
         InlineKeyboardButton("❌ Rollback Build", callback_data="reject_commit"),
     ]])
 
 
+def _fix_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard shown when Claude has proposed a fix after failing tests."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔧 Approve Fix", callback_data="approve_fix"),
+        InlineKeyboardButton("❌ Rollback", callback_data="reject_fix"),
+    ]])
+
+
 def _make_notify(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """
-    Return a notify coroutine that automatically attaches the commit approval
-    keyboard when the supervisor is in AWAITING_COMMIT_APPROVAL state.
+    Return a notify coroutine that attaches the appropriate inline keyboard
+    based on the supervisor's current state.
+      AWAITING_COMMIT_APPROVAL → commit/rollback keyboard
+      AWAITING_FIX_APPROVAL    → approve-fix/rollback keyboard
     Keeps Telegram UI concerns out of supervisor_loop.py.
     """
     async def notify(msg: str) -> None:
         state = supervisor.load_state().get("state")
-        markup = _commit_keyboard() if state == "AWAITING_COMMIT_APPROVAL" else None
+        if state == "AWAITING_COMMIT_APPROVAL":
+            markup = _commit_keyboard()
+        elif state == "AWAITING_FIX_APPROVAL":
+            markup = _fix_keyboard()
+        else:
+            markup = None
         await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=markup)
     return notify
+
+
+async def _run_smoke_tests() -> tuple[bool, list]:
+    """
+    Run the in-process smoke test suite and return (all_passed, results).
+    Injected as test_callback into supervisor.approve() so the build pipeline
+    runs tests automatically after every successful build.
+    """
+    from tests.telegram_smoke_tester import run_inprocess
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = int(os.environ.get("SMOKE_CHAT_ID", "0"))
+    return await run_inprocess(chat_id=chat_id, bot_token=token, send_summary=False)
 
 
 async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,7 +398,9 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sorry, you are not authorized.")
         return
     chat_id = update.effective_chat.id
-    reply = await supervisor.approve(chat_id, _make_notify(context, chat_id))
+    reply = await supervisor.approve(
+        chat_id, _make_notify(context, chat_id), test_callback=_run_smoke_tests
+    )
     await update.message.reply_text(reply)
 
 
@@ -411,12 +444,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
 
     if data == "approve":
-        reply = await supervisor.approve(chat_id, _make_notify(context, chat_id))
+        reply = await supervisor.approve(
+            chat_id, _make_notify(context, chat_id), test_callback=_run_smoke_tests
+        )
         await query.edit_message_reply_markup(reply_markup=None)
         await context.bot.send_message(chat_id=chat_id, text=reply)
 
     elif data == "reject":
         reply = supervisor.reject()
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+
+    elif data == "approve_fix":
+        reply = await supervisor.approve(
+            chat_id, _make_notify(context, chat_id), test_callback=_run_smoke_tests
+        )
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+
+    elif data == "reject_fix":
+        reply = supervisor.reject("fix rejected by user")
         await query.edit_message_reply_markup(reply_markup=None)
         await context.bot.send_message(chat_id=chat_id, text=reply)
 
@@ -431,6 +478,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=reply)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Global error handler for the Application.
+
+    409 Conflict means a second bot instance is polling the same token.
+    We exit immediately so launchd can restart us cleanly once the other
+    instance has been killed.  All other errors are logged and swallowed
+    so a single bad update cannot crash the bot.
+    """
+    err = context.error
+    if isinstance(err, TelegramConflict):
+        logger.critical(
+            "409 Conflict: another bot instance is polling this token. "
+            "Exiting so launchd can restart cleanly. "
+            "Check for duplicate launchd services or stale processes."
+        )
+        sys.exit(1)
+    logger.error("Unhandled exception in update handler", exc_info=err)
+
+
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -438,11 +505,14 @@ def main():
 
     app = Application.builder().token(token).build()
 
+    app.add_error_handler(error_handler)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("ai", ai_command))
+    app.add_handler(CommandHandler("recap", recap_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Supervisor coding loop
