@@ -58,8 +58,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help - show command list\n"
         "/ping - check if the bot is alive\n"
         "/ai - latest AI news summary\n"
+        "/recap - daily activity summary\n"
         "/id - show your Telegram user ID\n"
-        "/recap - daily activity summary\n\n"
+        "/clear - reset your conversation history\n"
+        "/whitelist - manage allowed users (owner only)\n\n"
         "Coding loop:\n"
         "/design <request> - generate a design proposal\n"
         "/approve - approve the pending proposal and start build\n"
@@ -206,20 +208,22 @@ def build_messages(user_id, user_text):
         else:
             extra_context = "\n\nWeb results:\nNo useful web results found."
 
-    history.append({
-        "role": "user",
-        "content": (
-            f"Current date and time: {current_datetime}\n\n"
-            f"User memory:\n{memory_text}\n\n"
-            f"User message:\n{user_text}{extra_context}"
-        ),
-    })
-
+    # Store only the clean user text in history — web results and metadata
+    # are ephemeral and should not be replayed on future turns.
+    history.append({"role": "user", "content": user_text})
     history = trim_history(history)
     store[user_id] = history
     save_conversation_store(store)
 
-    return history
+    # Build the full message for THIS call with date + memory + web context
+    # injected, without polluting the stored history.
+    enriched_content = (
+        f"Current date and time: {current_datetime}\n\n"
+        f"User memory:\n{memory_text}\n\n"
+        f"User message:\n{user_text}{extra_context}"
+    )
+    send_history = history[:-1] + [{"role": "user", "content": enriched_content}]
+    return send_history
 
 
 def append_assistant_reply(user_id, reply):
@@ -355,6 +359,80 @@ async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Your Telegram user ID is: {user_id}")
 
 
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reset conversation history for the calling user."""
+    if not update.effective_user or not update.message:
+        return
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("Sorry, you are not authorized to use this bot.")
+        return
+    user_id = f"telegram:{update.effective_user.id}"
+    store = get_conversation_store()
+    store.pop(user_id, None)
+    save_conversation_store(store)
+    await update.message.reply_text("Conversation history cleared. Fresh start!")
+
+
+async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Owner-only command to add or list whitelisted users.
+
+    Usage:
+      /whitelist           — show current allowed user IDs
+      /whitelist add <id>  — add a user ID to the whitelist
+    """
+    if not update.effective_user or not update.message:
+        return
+    # Only the first whitelisted user (the owner) may manage the whitelist.
+    allowed = load_whitelist()
+    owner_id = min(allowed) if allowed else None
+    if update.effective_user.id != owner_id:
+        await update.message.reply_text("Only the bot owner can manage the whitelist.")
+        return
+
+    args = context.args or []
+    if not args:
+        ids = ", ".join(str(i) for i in sorted(allowed)) if allowed else "(empty)"
+        await update.message.reply_text(f"Allowed users: {ids}")
+        return
+
+    if args[0].lower() == "add" and len(args) == 2:
+        try:
+            new_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("Usage: /whitelist add <numeric_user_id>")
+            return
+        if new_id in allowed:
+            await update.message.reply_text(f"{new_id} is already whitelisted.")
+            return
+        allowed.add(new_id)
+        save_whitelist(allowed)
+        logger.info("Owner added user %s to whitelist", new_id)
+        await update.message.reply_text(f"Added {new_id} to the whitelist.")
+        return
+
+    if args[0].lower() == "remove" and len(args) == 2:
+        try:
+            rm_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("Usage: /whitelist remove <numeric_user_id>")
+            return
+        if rm_id == owner_id:
+            await update.message.reply_text("Cannot remove the owner from the whitelist.")
+            return
+        allowed.discard(rm_id)
+        save_whitelist(allowed)
+        await update.message.reply_text(f"Removed {rm_id} from the whitelist.")
+        return
+
+    await update.message.reply_text(
+        "Usage:\n"
+        "  /whitelist              — list allowed users\n"
+        "  /whitelist add <id>     — add a user\n"
+        "  /whitelist remove <id>  — remove a user"
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user or not update.message.text:
         return
@@ -369,21 +447,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sorry, you are not authorized to use this bot.")
         return
 
+    # Show typing indicator immediately so the user knows the bot is working.
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action="typing"
+    )
+
     try:
+        needs_search = should_use_web(incoming_msg)
+        if needs_search:
+            # Let the user know a search is running before the slow DDGS call.
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id, action="typing"
+            )
+
         history = build_messages(user_id, incoming_msg)
-        model_response = ollama.chat(
-            model=MODEL,
-            messages=history
-        )
+        model_response = ollama.chat(model=MODEL, messages=history)
 
         reply = model_response["message"]["content"].strip()
+
+        # Store only the clean reply — not web results or metadata.
         append_assistant_reply(user_id, reply)
-        update_memory(user_id, incoming_msg)
+
+        # Run memory extraction in the background so it doesn't add latency.
+        asyncio.create_task(_update_memory_async(user_id, incoming_msg))
 
         await update.message.reply_text(reply)
     except Exception as e:
-        await update.message.reply_text(f"Error: {str(e)}")
         logger.exception("Error while handling Telegram message")
+        await update.message.reply_text("Sorry, something went wrong. Please try again.")
+
+
+async def _update_memory_async(user_id: str, user_text: str) -> None:
+    """Run memory extraction in a background task to avoid blocking replies."""
+    try:
+        await asyncio.to_thread(update_memory, user_id, user_text)
+    except Exception:
+        logger.exception("Background memory update failed for user %s", user_id)
 
 async def design_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message:
@@ -579,6 +678,8 @@ def main():
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("ai", ai_command))
     app.add_handler(CommandHandler("recap", recap_handler))
+    app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("whitelist", whitelist_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Supervisor coding loop
