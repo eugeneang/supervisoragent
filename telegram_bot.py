@@ -176,8 +176,10 @@ def save_conversation_store(store):
 
 
 def build_messages(user_id, user_text):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
     store = get_conversation_store()
-    memory = get_memory(user_id)
 
     if user_id not in store:
         store[user_id] = [
@@ -185,7 +187,10 @@ def build_messages(user_id, user_text):
         ]
 
     history = store[user_id]
-    memory_text = json.dumps(memory, indent=2, ensure_ascii=False)
+    memory_text = _memory_text(user_id)
+
+    now = datetime.now(ZoneInfo("Asia/Singapore"))
+    current_datetime = now.strftime("%A, %d %B %Y %H:%M SGT")
 
     extra_context = ""
 
@@ -203,7 +208,11 @@ def build_messages(user_id, user_text):
 
     history.append({
         "role": "user",
-        "content": f"User memory:\n{memory_text}\n\nUser message:\n{user_text}{extra_context}"
+        "content": (
+            f"Current date and time: {current_datetime}\n\n"
+            f"User memory:\n{memory_text}\n\n"
+            f"User message:\n{user_text}{extra_context}"
+        ),
     })
 
     history = trim_history(history)
@@ -225,7 +234,42 @@ def append_assistant_reply(user_id, reply):
     save_conversation_store(store)
 
 
+def _note_as_of(note: object, today: str) -> str:
+    """Render a memory note with its age for injection into the model context."""
+    if isinstance(note, dict) and "as_of" in note:
+        stored = note["as_of"]
+        text = note.get("text", json.dumps({k: v for k, v in note.items() if k != "as_of"}))
+        if stored == today:
+            return f"{text} (today)"
+        return f"{text} (as of {stored})"
+    if isinstance(note, str):
+        return note
+    return json.dumps(note)
+
+
+def _memory_text(user_id: str) -> str:
+    """
+    Render structured memory for injection into the model context.
+    Notes carry their 'as_of' date so the model can treat stale items with
+    appropriate scepticism rather than assuming everything is current.
+    """
+    from datetime import date
+    today = date.today().isoformat()
+    memory = get_memory(user_id)
+    rendered_notes = [_note_as_of(n, today) for n in memory.get("notes", [])]
+    return json.dumps(
+        {
+            "profile": memory.get("profile", {}),
+            "facts": memory.get("facts", {}),
+            "notes": rendered_notes,
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
 def update_memory(user_id, user_text):
+    from datetime import date
     memory_store = load_json(MEMORY_FILE)
     if user_id not in memory_store:
         memory_store[user_id] = {
@@ -234,8 +278,10 @@ def update_memory(user_id, user_text):
             "notes": []
         }
 
+    today = date.today().isoformat()
+
     extract_prompt = f"""
-Extract any useful long-term user memory from this message.
+Extract any useful LONG-TERM user memory from this message.
 
 Message:
 {user_text}
@@ -248,16 +294,22 @@ Return JSON only in this shape:
 }}
 
 Rules:
-- Only include useful long-term facts or preferences.
-- Keep keys short and consistent.
-- If nothing useful, return empty objects/lists.
+- LONG-TERM means it will still be true weeks or months from now.
+- profile: stable identity info (name, location, language, timezone).
+- facts: persistent preferences or habits (favourite food, sleep patterns, hobbies).
+- notes: brief strings for long-term context worth remembering.
+- DO NOT store one-time events, appointments, or anything with a specific date/time
+  (e.g. "meeting at 9am tomorrow", "dinner tonight") — these go stale immediately.
+- DO NOT store the current emotional state (e.g. "feeling down today") unless it
+  reveals a persistent pattern worth remembering.
+- Keep keys short and consistent. If nothing qualifies, return empty objects/lists.
 """
 
     try:
         response = ollama.chat(
             model=MODEL,
             messages=[
-                {"role": "system", "content": "You extract structured user memory."},
+                {"role": "system", "content": "You extract structured long-term user memory."},
                 {"role": "user", "content": extract_prompt}
             ]
         )
@@ -269,8 +321,22 @@ Rules:
         memory_store[user_id]["facts"].update(extracted.get("facts", {}))
 
         for note in extracted.get("notes", []):
-            if note not in memory_store[user_id]["notes"]:
-                memory_store[user_id]["notes"].append(note)
+            # Wrap plain strings with an as_of date so staleness is visible later
+            if isinstance(note, str) and note.strip():
+                entry = {"as_of": today, "text": note.strip()}
+            elif isinstance(note, dict):
+                note["as_of"] = today
+                entry = note
+            else:
+                continue
+            # Deduplicate by text content
+            existing_texts = {
+                (n.get("text") if isinstance(n, dict) else n)
+                for n in memory_store[user_id]["notes"]
+            }
+            text_key = entry.get("text") if isinstance(entry, dict) else entry
+            if text_key not in existing_texts:
+                memory_store[user_id]["notes"].append(entry)
 
         save_json(MEMORY_FILE, memory_store)
     except Exception:
