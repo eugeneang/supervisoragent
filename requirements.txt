@@ -4,3 +4,6 @@ requests
 ddgs
 anthropic
 pyyaml
+pytest
+pytest-asyncio
+ruff

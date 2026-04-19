@@ -1,0 +1,25 @@
+# ruff.toml — linter config for supervisoragent
+#
+# Goal: catch bugs (undefined names, unused imports) without being noisy
+# about style.  The F rules (pyflakes) are the critical ones — F821 is
+# exactly what would have caught the missing `import asyncio`.
+
+[lint]
+select = [
+    "F",    # pyflakes: undefined names (F821), unused imports (F401), etc.
+    "E9",   # syntax errors that py_compile also catches (belt-and-suspenders)
+    "W",    # pycodestyle warnings (e.g. invalid escape sequences)
+]
+ignore = [
+    "F401", # unused import — too noisy during active development
+]
+
+# Files that shouldn't be linted
+exclude = [
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".git",
+    "build",
+    "dist",
+]

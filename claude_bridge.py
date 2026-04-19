@@ -568,7 +568,6 @@ class ClaudeBridge:
         _CLOSE = '=== END FILE ==='
 
         edits: list[dict] = []
-        pos = 0
         for open_match in _OPEN.finditer(raw):
             path = open_match.group(1).strip()
             content_start = open_match.end() + 1  # skip the newline after the header
@@ -581,7 +580,6 @@ class ClaudeBridge:
             # Preserve trailing newline inside the block but strip the sentinel's newline
             content = raw[content_start:close_pos]
             edits.append({"path": path, "content": content})
-            pos = close_pos + len(_CLOSE)
 
         return edits
 

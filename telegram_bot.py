@@ -473,7 +473,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(_update_memory_async(user_id, incoming_msg))
 
         await update.message.reply_text(reply)
-    except Exception as e:
+    except Exception:
         logger.exception("Error while handling Telegram message")
         await update.message.reply_text("Sorry, something went wrong. Please try again.")
 
