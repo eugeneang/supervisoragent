@@ -2,15 +2,22 @@
 supervisor_loop.py — State machine for the approval-gated coding loop.
 
 States:
-  IDLE → DESIGNING → AWAITING_APPROVAL → BUILDING → AWAITING_COMMIT_APPROVAL
-                                                    ↓ approve_commit          ↓ reject_commit
-                                                 COMMITTING               IDLE (files rolled back)
+  IDLE → DESIGNING → AWAITING_APPROVAL → BUILDING → TESTING
+                                                    ↓ pass                ↓ fail
+                                         AWAITING_COMMIT_APPROVAL   AWAITING_FIX_APPROVAL
+                                                    ↓ approve_commit       ↓ approve (fix)
+                                                 COMMITTING           BUILDING (fix) → TESTING
                                                     ↓
                                                   DONE → IDLE (on next /design)
 
-  Failed build:   BUILDING → DONE (error preserved for /build_status)
-  /reject:        any state → IDLE (rolls back files when in AWAITING_COMMIT_APPROVAL)
-  /reset_build:   any state → IDLE (same rollback behaviour)
+  Failed build:            BUILDING → DONE
+  Tests pass:              TESTING → AWAITING_COMMIT_APPROVAL
+  Tests fail (< max):      TESTING → AWAITING_FIX_APPROVAL  (Claude proposes a fix)
+  Fix approved:            AWAITING_FIX_APPROVAL → BUILDING → TESTING  (loop repeats)
+  Fix attempts exhausted:  TESTING → DONE  (user must reject or reset)
+  /reject:                 any state → IDLE  (rolls back files from AWAITING_COMMIT_APPROVAL
+                                              and AWAITING_FIX_APPROVAL)
+  /reset_build:            any state → IDLE  (same rollback behaviour)
 
 State is persisted to supervisor_state.json (gitignored) so it survives bot restarts.
 All user-facing timestamps are displayed in SGT (GMT+8); internal storage is UTC.
@@ -33,21 +40,25 @@ REPO_ROOT = Path(__file__).parent.resolve()
 STATE_FILE = REPO_ROOT / "supervisor_state.json"
 
 # All user-facing timestamps are displayed in SGT (GMT+8).
-# Internal storage remains UTC ISO strings.
 _TZ_DISPLAY = ZoneInfo("Asia/Singapore")
 
-# launchd plist that owns the supervisor/bot process.
-_SUPERVISOR_PLIST = Path.home() / "Library/LaunchAgents/com.eugene.supervisor.plist"
+# launchd plist that owns the bot process.
+# com.eugene.telegram_bot is the authoritative job: it has WorkingDirectory set
+# correctly and is the only service that should start telegram_bot.py.
+# (com.eugene.supervisor was the old launcher and must remain unloaded.)
+_SUPERVISOR_PLIST = Path.home() / "Library/LaunchAgents/com.eugene.telegram_bot.plist"
 
 # How old a state must be (seconds) before it is considered stale.
 STALE_THRESHOLDS_SECONDS: dict[str, int] = {
-    "DESIGNING": 600,                # 10 min
-    "BUILDING": 1800,                # 30 min
-    "AWAITING_COMMIT_APPROVAL": 3600,  # 1 hr  (user may be away)
-    "COMMITTING": 120,               # 2 min  (git ops are fast)
+    "DESIGNING": 600,
+    "BUILDING": 1800,
+    "TESTING": 300,                    # 5 min is plenty for the in-process suite
+    "AWAITING_FIX_APPROVAL": 3600,     # user may be away
+    "AWAITING_COMMIT_APPROVAL": 3600,
+    "COMMITTING": 120,
 }
 
-# Constraints passed to the build step — protects all existing workflows.
+# Constraints passed to the build step.
 BUILD_CONSTRAINTS = [
     "Do not modify ai_news_push.py",
     "Do not modify health_monitor.py",
@@ -75,6 +86,10 @@ _DEFAULT_STATE: dict = {
     "pushed_branch": None,
     "build_summary": None,
     "error": None,
+    # Testing fields
+    "test_results": [],          # list of {command, passed, detail} dicts
+    "fix_proposal_text": None,   # Claude's fix proposal after test failure
+    "fix_attempt": 0,            # number of fix iterations attempted so far
     "created_at": None,
     "updated_at": None,
 }
@@ -85,9 +100,14 @@ _ACTIVE_STATES = frozenset({
     "DESIGNING",
     "AWAITING_APPROVAL",
     "BUILDING",
+    "TESTING",
+    "AWAITING_FIX_APPROVAL",
     "AWAITING_COMMIT_APPROVAL",
     "COMMITTING",
 })
+
+# Maximum automated fix iterations before requiring manual intervention.
+MAX_FIX_ATTEMPTS = 2
 
 
 class SupervisorLoop:
@@ -113,7 +133,7 @@ class SupervisorLoop:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(_TZ_DISPLAY).strftime("%Y-%m-%d %H:%M SGT")
         except Exception:
-            return ts_str  # fall back to raw string rather than crashing
+            return ts_str
 
     # ── Git helpers ──────────────────────────────────────────────────────────
 
@@ -135,29 +155,45 @@ class SupervisorLoop:
         r = self._git(["git", "rev-parse", "--abbrev-ref", "HEAD"])
         return r.stdout.strip() if r.returncode == 0 else "unknown"
 
+    def _diff_changed_files(self, changed_files: list[str], max_chars: int = 2800) -> str:
+        """
+        Return a truncated unified diff of the working-tree changes for the
+        given files.  Used to show a preview before the user clicks commit.
+        max_chars keeps the Telegram message well under the 4096-char limit.
+        """
+        if not changed_files:
+            return ""
+        result = self._git(["git", "diff", "--"] + changed_files)
+        diff = result.stdout
+        if not diff.strip():
+            # Files may be untracked (new files) — show a short summary instead
+            new_files = [f for f in changed_files if not self._git(["git", "ls-files", "--error-unmatch", f]).returncode == 0]
+            if new_files:
+                return "New files (no diff — not yet tracked by git):\n" + "\n".join(f"  + {f}" for f in new_files)
+            return ""
+        if len(diff) > max_chars:
+            diff = diff[:max_chars] + f"\n…(truncated, {len(diff) - max_chars} more chars)"
+        return diff
+
     def _rollback_build_files(self, changed_files: list[str]) -> tuple[bool, str]:
         """
         Revert working-tree changes written by the build step.
 
-        Rollback strategy:
-          • Files tracked in git at HEAD  →  git restore <file>  (reverts to HEAD)
+        Strategy:
+          • Files tracked in git at HEAD  →  git restore <file>
           • New files not yet in git      →  delete from disk
-        This only touches files the build wrote — unrelated working-tree changes
-        are not affected.
         """
         if not changed_files:
             return True, "No files to roll back."
 
         errors: list[str] = []
         for rel_path in changed_files:
-            # Check whether the file was tracked at HEAD before the build touched it
             tracked = self._git(["git", "ls-files", "--error-unmatch", rel_path])
             if tracked.returncode == 0:
                 res = self._git(["git", "restore", rel_path])
                 if res.returncode != 0:
                     errors.append(f"restore {rel_path}: {res.stderr.strip()}")
             else:
-                # New file created by the build — remove it
                 try:
                     (REPO_ROOT / rel_path).unlink(missing_ok=True)
                 except Exception as exc:
@@ -168,27 +204,17 @@ class SupervisorLoop:
     def _do_git_commit(
         self, changed_files: list[str], commit_msg: str
     ) -> tuple[bool, str]:
-        """
-        Stage → commit → push changed_files.
-
-        Returns (True, "<hash> <branch>") on full success.
-        Returns (False, "<error message>")  on any failure.
-        If push fails the local commit is reverted (git reset --soft HEAD~1) so
-        the working tree is preserved for inspection or a manual retry.
-        """
-        # 1. Verify there are actual changes to stage
+        """Stage → commit → push. Returns (True, "<hash> <branch>") or (False, error)."""
         files_arg = (["--"] + changed_files) if changed_files else []
         status = self._git(["git", "status", "--porcelain"] + files_arg)
         if not status.stdout.strip():
             return False, "No changes detected in the built files — nothing to commit."
 
-        # 2. Stage
         stage_cmd = (["git", "add", "--"] + changed_files) if changed_files else ["git", "add", "-A"]
         add = self._git(stage_cmd)
         if add.returncode != 0:
             return False, f"git add failed:\n{add.stderr.strip() or add.stdout.strip()}"
 
-        # 3. Commit
         commit = self._git(["git", "commit", "-m", commit_msg])
         if commit.returncode != 0:
             return False, f"git commit failed:\n{commit.stderr.strip() or commit.stdout.strip()}"
@@ -196,10 +222,8 @@ class SupervisorLoop:
         commit_hash = self._git(["git", "rev-parse", "--short", "HEAD"]).stdout.strip() or "unknown"
         branch = self._current_branch()
 
-        # 4. Push
         push = self._git(["git", "push", "origin", branch])
         if push.returncode != 0:
-            # Keep working-tree changes but undo the local commit
             self._git(["git", "reset", "--soft", "HEAD~1"])
             err = push.stderr.strip() or push.stdout.strip()
             return False, (
@@ -248,9 +272,7 @@ class SupervisorLoop:
     async def start_design(self, chat_id: int, request_text: str) -> tuple[str | None, str]:
         """
         Kick off a design proposal.
-
-        Returns (proposal_text, status_msg).
-        proposal_text is None when the caller should show only the status_msg.
+        Returns (proposal_text, status_msg); proposal_text is None on error.
         """
         async with self._lock:
             state = self.load_state()
@@ -295,91 +317,291 @@ class SupervisorLoop:
 
     # ── /approve ─────────────────────────────────────────────────────────────
 
-    async def approve(self, chat_id: int, notify_callback) -> str:
+    async def approve(self, chat_id: int, notify_callback, test_callback=None) -> str:
         """
-        Start the build in an asyncio background task.
-        notify_callback(msg) is called when the build finishes.
-        Returns an immediate acknowledgement string.
+        Start the build (or fix build) in an asyncio background task.
+
+        Handles two states:
+          AWAITING_APPROVAL     — initial build from the design proposal
+          AWAITING_FIX_APPROVAL — fix build after test failure
+
+        test_callback: async () → (bool, list) — injected by telegram_bot.py.
+        When provided, the build pipeline runs the test suite after a successful build
+        instead of going directly to AWAITING_COMMIT_APPROVAL.
         """
         async with self._lock:
             state = self.load_state()
-            if state["state"] != "AWAITING_APPROVAL":
-                return f"Nothing to approve right now (state: {state['state']})."
-            # Snapshot HEAD so rollback has a reference point even if git restore suffices
-            state["pre_build_head"] = self._current_head()
-            state["state"] = "BUILDING"
-            self.save_state(state)
-            build_request = {
-                "feature_name": state["feature_name"],
-                "request_text": state["request_text"],
-                "proposal_text": state["proposal_text"],
-                "repo_path": str(REPO_ROOT),
-                "constraints": BUILD_CONSTRAINTS,
-            }
+            current = state["state"]
 
-        asyncio.create_task(self._run_build(build_request, notify_callback))
-        return "Build started... Claude is writing code. This may take 30–60s."
+            if current == "AWAITING_APPROVAL":
+                state["pre_build_head"] = self._current_head()
+                state["state"] = "BUILDING"
+                self.save_state(state)
+                build_request = {
+                    "feature_name": state["feature_name"],
+                    "request_text": state["request_text"],
+                    "proposal_text": state["proposal_text"],
+                    "repo_path": str(REPO_ROOT),
+                    "constraints": BUILD_CONSTRAINTS,
+                }
+                ack = "Build started... Claude is writing code. This may take 30–60s."
+
+            elif current == "AWAITING_FIX_APPROVAL":
+                state["state"] = "BUILDING"
+                self.save_state(state)
+                fix_attempt = state.get("fix_attempt", 1)
+                build_request = {
+                    "feature_name": state.get("feature_name", "fix"),
+                    "request_text": state.get("request_text", ""),
+                    "proposal_text": state.get("fix_proposal_text", ""),
+                    "repo_path": str(REPO_ROOT),
+                    "constraints": BUILD_CONSTRAINTS,
+                }
+                ack = (
+                    f"Applying fix (attempt {fix_attempt}/{MAX_FIX_ATTEMPTS})... "
+                    "Claude is rewriting the failing code. This may take 30–60s."
+                )
+
+            else:
+                return f"Nothing to approve right now (state: {current})."
+
+        asyncio.create_task(self._run_build(build_request, notify_callback, test_callback))
+        return ack
 
     # ── Build runner ─────────────────────────────────────────────────────────
 
-    async def _run_build(self, build_request: dict, notify_callback) -> None:
+    async def _run_build(self, build_request: dict, notify_callback, test_callback=None) -> None:
         try:
             result: BuildResult = await self._get_bridge().execute_build(build_request)
         except Exception as e:
             logger.exception("Unexpected exception escaping execute_build")
             result = BuildResult(success=False, error=f"Unexpected error: {e}")
 
-        proposed_commit_msg = ""
         async with self._lock:
             state = self.load_state()
             if result.success:
+                # Accumulate changed_files across all build iterations (handles fix loops).
+                existing = set(state.get("changed_files") or [])
+                all_changed = sorted(existing | set(result.changed_files))
+                state.update({
+                    "changed_files": all_changed,
+                    "build_summary": result.summary,
+                    "error": None,
+                })
+                if test_callback is None:
+                    # No test gate — go straight to commit approval.
+                    feature_name = state.get("feature_name") or "feature"
+                    files_list = "\n".join(f"  - {f}" for f in all_changed) or "  (none)"
+                    proposed_commit_msg = (
+                        f"feat({feature_name}): implement {feature_name.replace('_', ' ')}\n\n"
+                        f"Files changed:\n{files_list}"
+                    )
+                    state.update({
+                        "state": "AWAITING_COMMIT_APPROVAL",
+                        "proposed_commit_msg": proposed_commit_msg,
+                    })
+            else:
+                state.update({
+                    "state": "DONE",
+                    "build_summary": None,
+                    "error": result.error,
+                })
+            self.save_state(state)
+            all_changed = list(state.get("changed_files") or [])
+
+        if not result.success:
+            try:
+                await notify_callback(f"Build failed ❌\n\nError: {result.error}")
+            except Exception:
+                logger.exception("notify_callback failed after build failure")
+            return
+
+        if test_callback is None:
+            async with self._lock:
+                state = self.load_state()
+                proposed_commit_msg = state.get("proposed_commit_msg", "")
+            files = "\n".join(f"  • {f}" for f in all_changed) or "  (no files changed)"
+            diff_preview = self._diff_changed_files(all_changed)
+            diff_section = (
+                f"\n\nDiff preview:\n```\n{diff_preview}\n```"
+                if diff_preview else ""
+            )
+            msg = (
+                "Build complete ✅\n\n"
+                f"Changed files:\n{files}\n\n"
+                f"Proposed commit message:\n{proposed_commit_msg}"
+                f"{diff_section}\n\n"
+                "Approve to commit & push, or reject to roll back."
+            )
+            try:
+                await notify_callback(msg)
+            except Exception:
+                logger.exception("notify_callback failed after build success")
+        else:
+            await self._run_tests(notify_callback, test_callback)
+
+    # ── Test runner ──────────────────────────────────────────────────────────
+
+    async def _run_tests(self, notify_callback, test_callback) -> None:
+        """Transition to TESTING, run test_callback, then route on pass/fail."""
+        async with self._lock:
+            state = self.load_state()
+            state["state"] = "TESTING"
+            self.save_state(state)
+
+        try:
+            await notify_callback("🧪 Running automated tests...")
+        except Exception:
+            logger.exception("notify_callback failed before test run")
+
+        try:
+            all_passed, raw_results = await test_callback()
+        except Exception as exc:
+            logger.exception("test_callback raised an exception")
+            all_passed = False
+            raw_results = [{"command": "smoke_runner", "passed": False, "detail": str(exc)}]
+
+        # Normalise to plain dicts for state persistence (handles SmokeResult dataclasses).
+        result_dicts: list[dict] = []
+        for r in raw_results:
+            if hasattr(r, "command"):
+                result_dicts.append({"command": r.command, "passed": r.passed, "detail": r.detail})
+            else:
+                result_dicts.append(dict(r))
+
+        async with self._lock:
+            state = self.load_state()
+            state["test_results"] = result_dicts
+            self.save_state(state)
+
+        if all_passed:
+            passed_count = len(result_dicts)
+            async with self._lock:
+                state = self.load_state()
                 feature_name = state.get("feature_name") or "feature"
-                files_list = "\n".join(f"  - {f}" for f in result.changed_files) or "  (none)"
+                all_changed = list(state.get("changed_files") or [])
+                files_list = "\n".join(f"  - {f}" for f in all_changed) or "  (none)"
                 proposed_commit_msg = (
                     f"feat({feature_name}): implement {feature_name.replace('_', ' ')}\n\n"
                     f"Files changed:\n{files_list}"
                 )
                 state.update({
                     "state": "AWAITING_COMMIT_APPROVAL",
-                    "changed_files": result.changed_files,
-                    "build_summary": result.summary,
                     "proposed_commit_msg": proposed_commit_msg,
-                    "error": None,
                 })
-            else:
-                # Failed build → DONE so /build_status shows the error,
-                # but DONE is not in _ACTIVE_STATES so the next /design is not blocked.
-                state.update({
-                    "state": "DONE",
-                    "changed_files": [],
-                    "build_summary": None,
-                    "error": result.error,
-                })
-            self.save_state(state)
+                self.save_state(state)
 
-        if result.success:
-            files = "\n".join(f"  • {f}" for f in result.changed_files) or "  (no files changed)"
+            files = "\n".join(f"  • {f}" for f in all_changed) or "  (no files changed)"
+            diff_preview = self._diff_changed_files(all_changed)
+            diff_section = (
+                f"\n\nDiff preview:\n```\n{diff_preview}\n```"
+                if diff_preview else ""
+            )
             msg = (
-                "Build complete ✅\n\n"
+                f"✅ Build complete — all {passed_count} test(s) passed!\n\n"
                 f"Changed files:\n{files}\n\n"
-                f"Proposed commit message:\n{proposed_commit_msg}\n\n"
+                f"Proposed commit message:\n{proposed_commit_msg}"
+                f"{diff_section}\n\n"
                 "Approve to commit & push, or reject to roll back."
             )
+            try:
+                await notify_callback(msg)
+            except Exception:
+                logger.exception("notify_callback failed after tests passed")
         else:
-            msg = f"Build failed ❌\n\nError: {result.error}"
+            await self._handle_test_failure(result_dicts, notify_callback)
+
+    # ── Test failure → fix proposal ──────────────────────────────────────────
+
+    async def _handle_test_failure(self, result_dicts: list[dict], notify_callback) -> None:
+        """
+        On test failure: generate a Claude fix proposal and transition to
+        AWAITING_FIX_APPROVAL.  After MAX_FIX_ATTEMPTS, give up and go to DONE.
+        """
+        async with self._lock:
+            state = self.load_state()
+            fix_attempt = state.get("fix_attempt", 0)
+            request_text = state.get("request_text", "")
+            proposal_text = state.get("proposal_text", "")
+            changed_files = list(state.get("changed_files") or [])
+
+        failed = [r for r in result_dicts if not r.get("passed")]
+        failures_text = "\n".join(
+            f"  ❌ {r['command']}: {r.get('detail', '')}" for r in failed
+        )
+
+        if fix_attempt >= MAX_FIX_ATTEMPTS:
+            async with self._lock:
+                state = self.load_state()
+                state.update({
+                    "state": "DONE",
+                    "error": (
+                        f"Tests failed after {fix_attempt} fix attempt(s). "
+                        "Manual intervention required."
+                    ),
+                })
+                self.save_state(state)
+            try:
+                await notify_callback(
+                    f"❌ Tests failed after {fix_attempt} fix attempt(s).\n\n"
+                    f"Failing tests:\n{failures_text}\n\n"
+                    "Use /reject to roll back or /reset_build to start over."
+                )
+            except Exception:
+                logger.exception("notify_callback failed after max fix attempts")
+            return
+
+        # Notify user: tests failed, generating a fix proposal.
+        try:
+            await notify_callback(
+                f"❌ {len(failed)}/{len(result_dicts)} test(s) failed.\n\n"
+                f"Failing:\n{failures_text}\n\n"
+                "Analyzing failures and generating a fix proposal... ⏳"
+            )
+        except Exception:
+            logger.exception("notify_callback failed before fix proposal generation")
+
+        fix_result = await self._get_bridge().generate_fix_proposal(
+            failed_tests=failed,
+            original_request=request_text,
+            original_proposal=proposal_text,
+            changed_files=changed_files,
+        )
+
+        async with self._lock:
+            state = self.load_state()
+            if fix_result.error:
+                state.update({"state": "DONE", "error": fix_result.error})
+                self.save_state(state)
+                try:
+                    await notify_callback(
+                        f"Failed to generate fix proposal:\n{fix_result.error}"
+                    )
+                except Exception:
+                    logger.exception("notify_callback failed after fix proposal error")
+                return
+
+            state.update({
+                "state": "AWAITING_FIX_APPROVAL",
+                "fix_proposal_text": fix_result.proposal_text,
+                "fix_attempt": fix_attempt + 1,
+            })
+            self.save_state(state)
+            current_attempt = fix_attempt + 1
 
         try:
-            await notify_callback(msg)
+            await notify_callback(
+                f"🔍 Fix Proposal (attempt {current_attempt}/{MAX_FIX_ATTEMPTS}):\n\n"
+                f"{fix_result.proposal_text}\n\n"
+                "Approve to apply the fix, or reject to roll back the entire build."
+            )
         except Exception:
-            logger.exception("notify_callback failed after build")
+            logger.exception("notify_callback failed after fix proposal ready")
 
     # ── Commit approval ──────────────────────────────────────────────────────
 
     async def approve_commit(self, notify_callback) -> str:
-        """
-        Kick off the commit/push in a background task.
-        Returns an immediate acknowledgement string.
-        """
+        """Kick off commit/push in a background task."""
         async with self._lock:
             state = self.load_state()
             if state["state"] != "AWAITING_COMMIT_APPROVAL":
@@ -445,14 +667,11 @@ class SupervisorLoop:
                 logger.exception("notify_callback failed after commit failure")
 
     def _schedule_restart(self) -> None:
-        """
-        Spawn a detached subprocess that unloads then reloads the launchd service.
-        The 3-second sleep ensures the Telegram success message is delivered before
-        the current bot process is killed by launchctl unload.
-        launchd's KeepAlive will restart the bot after load.
-        """
+        """Spawn a detached subprocess that restarts the launchd service after 3s."""
         if not _SUPERVISOR_PLIST.exists():
-            logger.warning("Supervisor plist not found at %s — skipping restart", _SUPERVISOR_PLIST)
+            logger.warning(
+                "Supervisor plist not found at %s — skipping restart", _SUPERVISOR_PLIST
+            )
             return
         cmd = (
             f"sleep 3 "
@@ -462,7 +681,7 @@ class SupervisorLoop:
         )
         subprocess.Popen(
             ["bash", "-c", cmd],
-            start_new_session=True,  # detach from current process group
+            start_new_session=True,
             close_fds=True,
         )
         logger.info("Service restart scheduled via detached subprocess (~3s)")
@@ -499,11 +718,11 @@ class SupervisorLoop:
     # ── /reset_build ─────────────────────────────────────────────────────────
 
     def force_reset(self) -> str:
-        """Force-reset to IDLE from any state, including stuck DESIGNING/BUILDING."""
+        """Force-reset to IDLE from any state, rolling back build files when needed."""
         state = self.load_state()
         prev = state.get("state", "IDLE")
         rollback_note = ""
-        if prev == "AWAITING_COMMIT_APPROVAL":
+        if prev in ("AWAITING_COMMIT_APPROVAL", "AWAITING_FIX_APPROVAL"):
             changed_files = list(state.get("changed_files") or [])
             ok, err_msg = self._rollback_build_files(changed_files)
             rollback_note = (
@@ -517,12 +736,12 @@ class SupervisorLoop:
     # ── /reject ──────────────────────────────────────────────────────────────
 
     def reject(self, reason: str = "") -> str:
-        """Reset to IDLE from any state, rolling back build files if needed."""
+        """Reset to IDLE from any state, rolling back build files when needed."""
         state = self.load_state()
         prev = state.get("state", "IDLE")
 
         rollback_note = ""
-        if prev == "AWAITING_COMMIT_APPROVAL":
+        if prev in ("AWAITING_COMMIT_APPROVAL", "AWAITING_FIX_APPROVAL"):
             changed_files = list(state.get("changed_files") or [])
             ok, err_msg = self._rollback_build_files(changed_files)
             rollback_note = (
@@ -570,9 +789,23 @@ class SupervisorLoop:
             lines.append("Changed: " + ", ".join(state["changed_files"]))
         if state.get("build_summary"):
             lines.append(f"Build: {state['build_summary']}")
+
+        # Test results summary
+        test_results = state.get("test_results") or []
+        if test_results:
+            passed = sum(1 for r in test_results if r.get("passed"))
+            total = len(test_results)
+            lines.append(f"Tests: {passed}/{total} passed")
+            for r in test_results:
+                if not r.get("passed"):
+                    lines.append(f"  ❌ {r['command']}: {r.get('detail', '')[:60]}")
+
         if s == "AWAITING_COMMIT_APPROVAL" and state.get("proposed_commit_msg"):
             first_line = state["proposed_commit_msg"].splitlines()[0]
             lines.append(f"Commit msg: {first_line}")
+        if s == "AWAITING_FIX_APPROVAL":
+            fix_attempt = state.get("fix_attempt", 0)
+            lines.append(f"Fix attempt: {fix_attempt}/{MAX_FIX_ATTEMPTS}")
         if state.get("commit_hash"):
             lines.append(f"Commit: {state['commit_hash']} → {state.get('pushed_branch', '?')}")
         if state.get("error"):
