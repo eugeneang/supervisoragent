@@ -22,6 +22,7 @@ logs/
 
 # API keys and local config
 ai_news_push.env
+ai_news_config.json
 config.local.json
 secrets.json
 conversation_store.json
