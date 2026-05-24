@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Read staged git diff and print one conventional-commit line via local Ollama.
+Read staged git diff and print one conventional-commit line via Claude Haiku.
 """
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import re
 import subprocess
 import sys
 
-import ollama
+import anthropic
 
-MODEL = "qwen2.5:7b"
+MODEL = "claude-haiku-4-5-20251001"
 MAX_DIFF_CHARS = 100_000
 
 # One line: type(optional-scope): subject — subject is short, imperative, no prose.
@@ -20,7 +20,7 @@ COMMIT_LINE_RE = re.compile(
     r":\s[^\s].{0,88}$"
 )
 
-OLLAMA_OPTIONS = {"temperature": 0.2, "num_predict": 80}
+_ai_client = anthropic.Anthropic()
 
 
 def git_root() -> str:
@@ -108,17 +108,19 @@ def is_valid_conventional_line(line: str) -> bool:
     return True
 
 
-def ollama_line(messages: list[dict]) -> str:
+def haiku_line(system: str, user: str) -> str:
     try:
-        resp = ollama.chat(
+        resp = _ai_client.messages.create(
             model=MODEL,
-            messages=messages,
-            options=OLLAMA_OPTIONS,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            max_tokens=80,
+            temperature=0.2,
         )
     except Exception as e:
-        print(f"smart_commit: Ollama error ({MODEL}): {e}", file=sys.stderr)
+        print(f"smart_commit: API error ({MODEL}): {e}", file=sys.stderr)
         sys.exit(1)
-    content = (resp.get("message") or {}).get("content") or ""
+    content = resp.content[0].text if resp.content else ""
     return normalize_line(content)
 
 
@@ -136,12 +138,7 @@ def generate_message(diff: str, cwd: str) -> str:
     )
     user = "Staged diff:\n\n" + diff + ("\n\n(diff truncated)\n" if truncated else "")
 
-    line = ollama_line(
-        [
-            {"role": "system", "content": system_strict},
-            {"role": "user", "content": user},
-        ]
-    )
+    line = haiku_line(system_strict, user)
     if is_valid_conventional_line(line):
         return line
 
@@ -153,12 +150,7 @@ def generate_message(diff: str, cwd: str) -> str:
         "Same diff summary — pick the best type and a short subject:\n\n"
         + diff[:8000]
     )
-    line2 = ollama_line(
-        [
-            {"role": "system", "content": system_strict},
-            {"role": "user", "content": retry_user},
-        ]
-    )
+    line2 = haiku_line(system_strict, retry_user)
     if is_valid_conventional_line(line2):
         return line2
 

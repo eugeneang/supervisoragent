@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class TestResult:
+class TestResult:  # noqa: N801 — name starts with Test but is not a test class
     command: str
     description: str
     passed: bool

@@ -1,13 +1,13 @@
 import json
 from pathlib import Path
 
-import ollama
+import anthropic
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 
 app = Flask(__name__)
 
-MODEL = "qwen2.5:7b"
+MODEL = "claude-haiku-4-5-20251001"
 ALLOWED_USERS = {
     "whatsapp:+6598807621",
     "whatsapp:+6593885619",
@@ -20,6 +20,8 @@ You are a helpful personal supervisor assistant.
 Use the user's memory when relevant.
 Be concise, practical, and clear.
 """
+
+_ai_client = anthropic.Anthropic()
 
 
 def load_json(path):
@@ -35,9 +37,7 @@ def save_json(path, data):
 
 
 def trim_history(history, max_messages=8):
-    if len(history) <= max_messages:
-        return history
-    return [history[0]] + history[-(max_messages - 1):]
+    return history[-max_messages:]
 
 
 def get_memory(user_id):
@@ -64,12 +64,8 @@ def build_messages(user_id, user_text):
     store = get_conversation_store()
     memory = get_memory(user_id)
 
-    if user_id not in store:
-        store[user_id] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-
-    history = store[user_id]
+    # Strip legacy system messages — system prompt injected at call time
+    history = [m for m in store.get(user_id, []) if m.get("role") != "system"]
 
     memory_text = json.dumps(memory, indent=2, ensure_ascii=False)
 
@@ -87,13 +83,9 @@ def build_messages(user_id, user_text):
 
 def append_assistant_reply(user_id, reply):
     store = get_conversation_store()
-    if user_id not in store:
-        store[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    store[user_id].append({
-        "role": "assistant",
-        "content": reply
-    })
-    store[user_id] = trim_history(store[user_id])
+    history = [m for m in store.get(user_id, []) if m.get("role") != "system"]
+    history.append({"role": "assistant", "content": reply})
+    store[user_id] = trim_history(history)
     save_conversation_store(store)
 
 
@@ -126,15 +118,19 @@ Rules:
 """
 
     try:
-        response = ollama.chat(
+        response = _ai_client.messages.create(
             model=MODEL,
-            messages=[
-                {"role": "system", "content": "You extract structured user memory."},
-                {"role": "user", "content": extract_prompt}
-            ]
+            system="You extract structured user memory. Reply with JSON only.",
+            messages=[{"role": "user", "content": extract_prompt}],
+            max_tokens=512,
         )
 
-        content = response["message"]["content"].strip()
+        content = response.content[0].text.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.strip()
         extracted = json.loads(content)
 
         memory_store[user_id]["profile"].update(extracted.get("profile", {}))
@@ -168,12 +164,14 @@ def whatsapp_reply():
     try:
         _, history = build_messages(sender, incoming_msg)
 
-        model_response = ollama.chat(
+        model_response = _ai_client.messages.create(
             model=MODEL,
-            messages=history
+            system=SYSTEM_PROMPT,
+            messages=history,
+            max_tokens=1024,
         )
 
-        reply = model_response["message"]["content"].strip()
+        reply = model_response.content[0].text.strip()
         append_assistant_reply(sender, reply)
         update_memory(sender, incoming_msg)
 

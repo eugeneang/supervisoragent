@@ -1,17 +1,22 @@
+# --- imports + module-level setup ---
 import asyncio
 import json
 import os
+import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import logging
 
 from agents.ai_news_agent import get_ai_news_digest
 
-import ollama
+import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import Conflict as TelegramConflict
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -21,518 +26,429 @@ from telegram.ext import (
 from supervisor_loop import SupervisorLoop
 from commands.ping import ping_command
 from commands.recap import recap_handler
+from commands.idea import generate_idea
+from flows.idea_flow import IdeaFlow, IdeaState
 
 from ddgs import DDGS
 
-supervisor = SupervisorLoop()
-
-WHITELIST_FILE = Path("whitelist.json")
-AUTO_WHITELIST_LIMIT = 2
-MODEL = "qwen2.5:7b"
-CONVERSATION_FILE = Path("conversation_store.json")
-MEMORY_FILE = Path("structured_memory.json")
-
-SYSTEM_PROMPT = """
-You are a helpful personal supervisor assistant.
-Use the user's memory when relevant.
-Be concise, practical, and clear.
-Keep replies short and chat-friendly.
-
-If web results are provided, use them.
-If the web results are weak or incomplete, say so clearly.
-Do not pretend you searched the internet unless web results are included.
-"""
-
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
 )
-
 logger = logging.getLogger(__name__)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "Available commands:\n\n"
-        "/help - show command list\n"
-        "/ping - check if the bot is alive\n"
-        "/ai - latest AI news summary\n"
-        "/recap - daily activity summary\n"
-        "/id - show your Telegram user ID\n"
-        "/clear - reset your conversation history\n"
-        "/whitelist - manage allowed users (owner only)\n\n"
-        "Coding loop:\n"
-        "/design <request> - generate a design proposal\n"
-        "/approve - approve the pending proposal and start build\n"
-        "/reject [reason] - reject/rollback and reset to IDLE\n"
-        "/build_status - show current loop state and timestamps\n"
-        "/reset_build - force-reset stuck state to IDLE\n\n"
-        "After a build completes you will see inline buttons:\n"
-        "  ✅ Commit & Push — commit, push, and restart services\n"
-        "  ❌ Rollback Build — revert all build file changes"
-    )
-    await update.message.reply_text(help_text)
+# ---------------------------------------------------------------------------
+# Config / constants
+# ---------------------------------------------------------------------------
+import config
 
-async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user:
-        return
+AUTHORIZED_USER_ID: int | None = getattr(config, "AUTHORIZED_USER_ID", None)
+MEMORY_FILE: Path = Path(getattr(config, "MEMORY_FILE", "/tmp/bot_memory.json"))
+WHITELIST_FILE = Path("whitelist.json")
+AUTO_WHITELIST_LIMIT = 2
+CONVERSATION_FILE = Path("conversation_store.json")
+MEMORY_STORE_FILE = Path("memory_store.json")
+CHAT_MODEL = "claude-haiku-4-5-20251001"
+_SGT = ZoneInfo("Asia/Singapore")
 
-    telegram_user_id = update.effective_user.id
+supervisor = SupervisorLoop()
 
-    if not is_user_allowed(telegram_user_id):
-        await update.message.reply_text("Sorry, you are not authorized to use this bot.")
-        return
+# ---------------------------------------------------------------------------
+# Module-level idea flow state (single-user bot)
+# ---------------------------------------------------------------------------
+_idea_flow = IdeaFlow()
 
-    await update.message.reply_text("Fetching latest AI news...")
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    try:
-        digest = get_ai_news_digest()
-        await update.message.reply_text(digest)
-    except Exception:
-        logger.exception("Failed to fetch AI news")
-        await update.message.reply_text("Sorry, I couldn't fetch AI news right now.")
-
-def load_json(path):
+def load_json(path: Path) -> dict:
     if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("Could not read JSON file %s", path)
     return {}
 
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+def save_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def search_web(query, max_results=5):
-    results = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=max_results):
-            title = r.get("title", "")
-            body = r.get("body", "")
-            href = r.get("href", "")
-            results.append({
-                "title": title,
-                "body": body,
-                "href": href
-            })
-    return results
 
-def should_use_web(user_text):
-    web_keywords = [
-        "today", "latest", "current", "news", "weather", "near me",
-        "restaurant", "food", "open now", "price", "stock", "flight",
-        "traffic", "map", "review", "best"
+def _parse_ts(ts: str | None) -> datetime:
+    if not ts:
+        return datetime(1970, 1, 1, tzinfo=_SGT)
+    try:
+        parsed = datetime.fromisoformat(ts)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_SGT)
+        return parsed.astimezone(_SGT)
+    except Exception:
+        return datetime(1970, 1, 1, tzinfo=_SGT)
+
+
+def _window_history(history: list[dict], max_messages: int = 20) -> list[dict]:
+    cutoff = datetime.now(_SGT) - timedelta(hours=72)
+    recent = [
+        msg for msg in history
+        if msg.get("role") != "system" and _parse_ts(msg.get("ts")) >= cutoff
     ]
-    text = user_text.lower()
-    return any(k in text for k in web_keywords)
+    return recent[-max_messages:]
 
-def load_whitelist():
+
+def _trim_store(history: list[dict], max_messages: int = 50) -> list[dict]:
+    return [msg for msg in history if msg.get("role") != "system"][-max_messages:]
+
+
+def load_whitelist() -> set[int]:
     data = load_json(WHITELIST_FILE)
-    return set(data.get("allowed_users", []))
+    return {int(uid) for uid in data.get("allowed_users", [])}
 
 
-def save_whitelist(users):
-    save_json(WHITELIST_FILE, {
-        "allowed_users": list(users)
-    })
+def save_whitelist(users: set[int]) -> None:
+    save_json(WHITELIST_FILE, {"allowed_users": sorted(users)})
 
-def is_user_allowed(user_id):
+
+def is_user_allowed(user_id: int) -> bool:
+    if AUTHORIZED_USER_ID is not None:
+        return user_id == AUTHORIZED_USER_ID
+
     allowed = load_whitelist()
-
     if user_id in allowed:
         return True
-
     if len(allowed) < AUTO_WHITELIST_LIMIT:
-        logger.info(f"Auto-whitelisting new user: {user_id}")
         allowed.add(user_id)
         save_whitelist(allowed)
+        logger.info("Auto-whitelisted Telegram user %s", user_id)
         return True
-
     return False
 
-def trim_history(history, max_messages=8):
-    if len(history) <= max_messages:
-        return history
-    return [history[0]] + history[-(max_messages - 1):]
+
+def load_user_memory(user_id: str) -> list[dict]:
+    store = load_json(MEMORY_STORE_FILE)
+    notes = store.get(user_id, [])
+    return notes if isinstance(notes, list) else []
 
 
-def get_memory(user_id):
-    memory = load_json(MEMORY_FILE)
-    if user_id not in memory:
-        memory[user_id] = {
-            "profile": {},
-            "facts": {},
-            "notes": []
-        }
-        save_json(MEMORY_FILE, memory)
-    return memory[user_id]
+def save_user_memory(user_id: str, notes: list[dict]) -> None:
+    store = load_json(MEMORY_STORE_FILE)
+    store[user_id] = notes
+    save_json(MEMORY_STORE_FILE, store)
 
 
-def get_conversation_store():
-    return load_json(CONVERSATION_FILE)
+def _memory_context(user_id: str) -> str:
+    notes = load_user_memory(user_id)
+    if not notes:
+        return "none"
+    return "\n".join(f"- {note.get('text', '')}" for note in notes if note.get("text"))
 
 
-def save_conversation_store(store):
+def build_messages(user_id: str, user_text: str) -> tuple[str, list[dict]]:
+    store = load_json(CONVERSATION_FILE)
+    history = _trim_store(store.get(user_id, []))
+    now = datetime.now(_SGT)
+    history.append({
+        "role": "user",
+        "content": user_text,
+        "ts": now.isoformat(),
+    })
+    store[user_id] = _trim_store(history)
+    save_json(CONVERSATION_FILE, store)
+
+    system = (
+        "You are a helpful personal supervisor assistant. "
+        "Be concise, practical, and clear.\n\n"
+        f"Current date and time: {now.strftime('%A, %d %B %Y %H:%M SGT')}\n\n"
+        f"User memory:\n{_memory_context(user_id)}"
+    )
+    messages = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in _window_history(store[user_id])
+        if msg.get("role") in {"user", "assistant"}
+    ]
+    return system, messages
+
+
+def append_assistant_reply(user_id: str, reply: str) -> None:
+    store = load_json(CONVERSATION_FILE)
+    history = _trim_store(store.get(user_id, []))
+    history.append({
+        "role": "assistant",
+        "content": reply,
+        "ts": datetime.now(_SGT).isoformat(),
+    })
+    store[user_id] = _trim_store(history)
     save_json(CONVERSATION_FILE, store)
 
 
-def build_messages(user_id, user_text):
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-
-    store = get_conversation_store()
-
-    if user_id not in store:
-        store[user_id] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-
-    history = store[user_id]
-    memory_text = _memory_text(user_id)
-
-    now = datetime.now(ZoneInfo("Asia/Singapore"))
-    current_datetime = now.strftime("%A, %d %B %Y %H:%M SGT")
-
-    extra_context = ""
-
-    if should_use_web(user_text):
-        web_results = search_web(user_text, max_results=5)
-        if web_results:
-            formatted = []
-            for i, r in enumerate(web_results, start=1):
-                formatted.append(
-                    f"{i}. Title: {r['title']}\nSummary: {r['body']}\nLink: {r['href']}"
-                )
-            extra_context = "\n\nWeb results:\n" + "\n\n".join(formatted)
-        else:
-            extra_context = "\n\nWeb results:\nNo useful web results found."
-
-    # Store only the clean user text in history — web results and metadata
-    # are ephemeral and should not be replayed on future turns.
-    history.append({"role": "user", "content": user_text})
-    history = trim_history(history)
-    store[user_id] = history
-    save_conversation_store(store)
-
-    # Build the full message for THIS call with date + memory + web context
-    # injected, without polluting the stored history.
-    enriched_content = (
-        f"Current date and time: {current_datetime}\n\n"
-        f"User memory:\n{memory_text}\n\n"
-        f"User message:\n{user_text}{extra_context}"
+async def _chat_with_tools(system_prompt: str, messages: list[dict]) -> str:
+    client = anthropic.Anthropic()
+    response = await asyncio.to_thread(
+        client.messages.create,
+        model=CHAT_MODEL,
+        max_tokens=1024,
+        system=system_prompt,
+        messages=messages,
     )
-    send_history = history[:-1] + [{"role": "user", "content": enriched_content}]
-    return send_history
+    return response.content[0].text.strip()
 
 
-def append_assistant_reply(user_id, reply):
-    store = get_conversation_store()
-    if user_id not in store:
-        store[user_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    store[user_id].append({
-        "role": "assistant",
-        "content": reply
-    })
-    store[user_id] = trim_history(store[user_id])
-    save_conversation_store(store)
+def _load_memory() -> dict:
+    if MEMORY_FILE.exists():
+        try:
+            return json.loads(MEMORY_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
 
 
-def _note_as_of(note: object, today: str) -> str:
-    """Render a memory note with its age for injection into the model context."""
-    if isinstance(note, dict) and "as_of" in note:
-        stored = note["as_of"]
-        text = note.get("text", json.dumps({k: v for k, v in note.items() if k != "as_of"}))
-        if stored == today:
-            return f"{text} (today)"
-        return f"{text} (as of {stored})"
-    if isinstance(note, str):
-        return note
-    return json.dumps(note)
+def _save_memory(data: dict) -> None:
+    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MEMORY_FILE.write_text(json.dumps(data, indent=2))
 
 
-def _memory_text(user_id: str) -> str:
-    """
-    Render structured memory for injection into the model context.
-    Notes carry their 'as_of' date so the model can treat stale items with
-    appropriate scepticism rather than assuming everything is current.
-    """
-    from datetime import date
-    today = date.today().isoformat()
-    memory = get_memory(user_id)
-    rendered_notes = [_note_as_of(n, today) for n in memory.get("notes", [])]
-    return json.dumps(
-        {
-            "profile": memory.get("profile", {}),
-            "facts": memory.get("facts", {}),
-            "notes": rendered_notes,
-        },
-        indent=2,
-        ensure_ascii=False,
+def _is_authorized(update: Update) -> bool:
+    return bool(update.effective_user and is_user_allowed(update.effective_user.id))
+
+
+# ---------------------------------------------------------------------------
+# Auth guard decorator
+# ---------------------------------------------------------------------------
+
+def _require_auth(func):
+    import functools
+
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update):
+            await update.message.reply_text("⛔ Unauthorized.")
+            return
+        return await func(update, context)
+
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Basic commands
+# ---------------------------------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name = update.effective_user.first_name or "there"
+    await update.message.reply_text(f"Hello, {name}! I'm your agent bot. Type /help to see what I can do.")
+
+
+async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    await update.message.reply_text(f"Your Telegram user ID is: {uid}")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "Available commands:\n"
+        "/ping — liveness check\n"
+        "/id — show your Telegram user ID\n"
+        "/start — greeting\n"
+        "/help — this message\n"
+        "/ai — AI news digest\n"
+        "/recap — daily activity summary\n"
+        "/remember <key> <value> — store a memory\n"
+        "/memory — list all memories\n"
+        "/forget <key> — remove a memory\n"
+        "/clear — clear conversation context\n"
+        "/whitelist — show authorized user ID\n"
+        "/design <task> — start a supervised coding task\n"
+        "/approve — approve current build\n"
+        "/reject — reject current build\n"
+        "/build_status — show supervisor state\n"
+        "/reset_build — reset supervisor to IDLE\n"
+        "/idea [topic] — generate a project idea\n"
     )
+    await update.message.reply_text(text)
 
 
-def update_memory(user_id, user_text):
-    from datetime import date
-    memory_store = load_json(MEMORY_FILE)
-    if user_id not in memory_store:
-        memory_store[user_id] = {
-            "profile": {},
-            "facts": {},
-            "notes": []
-        }
-
-    today = date.today().isoformat()
-
-    extract_prompt = f"""
-Extract any useful LONG-TERM user memory from this message.
-
-Message:
-{user_text}
-
-Return JSON only in this shape:
-{{
-  "profile": {{}},
-  "facts": {{}},
-  "notes": []
-}}
-
-Rules:
-- LONG-TERM means it will still be true weeks or months from now.
-- profile: stable identity info (name, location, language, timezone).
-- facts: persistent preferences or habits (favourite food, sleep patterns, hobbies).
-- notes: brief strings for long-term context worth remembering.
-- DO NOT store one-time events, appointments, or anything with a specific date/time
-  (e.g. "meeting at 9am tomorrow", "dinner tonight") — these go stale immediately.
-- DO NOT store the current emotional state (e.g. "feeling down today") unless it
-  reveals a persistent pattern worth remembering.
-- Keep keys short and consistent. If nothing qualifies, return empty objects/lists.
-"""
-
-    try:
-        response = ollama.chat(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": "You extract structured long-term user memory."},
-                {"role": "user", "content": extract_prompt}
-            ]
-        )
-
-        content = response["message"]["content"].strip()
-        extracted = json.loads(content)
-
-        memory_store[user_id]["profile"].update(extracted.get("profile", {}))
-        memory_store[user_id]["facts"].update(extracted.get("facts", {}))
-
-        for note in extracted.get("notes", []):
-            # Wrap plain strings with an as_of date so staleness is visible later
-            if isinstance(note, str) and note.strip():
-                entry = {"as_of": today, "text": note.strip()}
-            elif isinstance(note, dict):
-                note["as_of"] = today
-                entry = note
-            else:
-                continue
-            # Deduplicate by text content
-            existing_texts = {
-                (n.get("text") if isinstance(n, dict) else n)
-                for n in memory_store[user_id]["notes"]
-            }
-            text_key = entry.get("text") if isinstance(entry, dict) else entry
-            if text_key not in existing_texts:
-                memory_store[user_id]["notes"].append(entry)
-
-        save_json(MEMORY_FILE, memory_store)
-    except Exception:
-        logger.exception("Failed to update memory")
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(
-        f"Hello {user.first_name or 'there'}! Send me a message and I'll reply."
-    )
-
-
-async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.message.reply_text(f"Your Telegram user ID is: {user_id}")
-
-
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reset conversation history for the calling user."""
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
     if not is_user_allowed(update.effective_user.id):
         await update.message.reply_text("Sorry, you are not authorized to use this bot.")
+        return
+
+    user_id = f"telegram:{update.effective_user.id}"
+    store = load_json(CONVERSATION_FILE)
+    store.pop(user_id, None)
+    save_json(CONVERSATION_FILE, store)
+
+    if context.args and context.args[0].lower() == "all":
+        save_user_memory(user_id, [])
+        await update.message.reply_text("Conversation history and memory cleared. Fresh start!")
+    else:
+        await update.message.reply_text("Conversation history cleared. Fresh start!")
+
+
+# ---------------------------------------------------------------------------
+# Memory commands
+# ---------------------------------------------------------------------------
+
+async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("Sorry, you are not authorized to use this bot.")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /remember <note>")
+        return
+    note_text = " ".join(args).strip()
+    user_id = f"telegram:{update.effective_user.id}"
+    notes = load_user_memory(user_id)
+    notes.append({"text": note_text, "saved_at": datetime.now(_SGT).isoformat()})
+    save_user_memory(user_id, notes)
+    await update.message.reply_text(f"Remembered: {note_text}")
+
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("Sorry, you are not authorized to use this bot.")
+        return
+    notes = load_user_memory(f"telegram:{update.effective_user.id}")
+    if not notes:
+        await update.message.reply_text("No memories stored.")
+        return
+    lines = [f"[{idx}] {note.get('text', '')}" for idx, note in enumerate(notes, start=1)]
+    await update.message.reply_text("Memories:\n" + "\n".join(lines))
+
+
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not update.message:
+        return
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("Sorry, you are not authorized to use this bot.")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /forget <memory_number>")
+        return
+    try:
+        index = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Usage: /forget <memory_number>")
         return
     user_id = f"telegram:{update.effective_user.id}"
-    store = get_conversation_store()
-    store.pop(user_id, None)
-    save_conversation_store(store)
-    await update.message.reply_text("Conversation history cleared. Fresh start!")
-
-
-async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Owner-only command to add or list whitelisted users.
-
-    Usage:
-      /whitelist           — show current allowed user IDs
-      /whitelist add <id>  — add a user ID to the whitelist
-    """
-    if not update.effective_user or not update.message:
+    notes = load_user_memory(user_id)
+    if index < 1 or index > len(notes):
+        await update.message.reply_text(f"No note with ID {index}.")
         return
-    # Only the first whitelisted user (the owner) may manage the whitelist.
-    allowed = load_whitelist()
-    owner_id = min(allowed) if allowed else None
-    if update.effective_user.id != owner_id:
-        await update.message.reply_text("Only the bot owner can manage the whitelist.")
-        return
-
-    args = context.args or []
-    if not args:
-        ids = ", ".join(str(i) for i in sorted(allowed)) if allowed else "(empty)"
-        await update.message.reply_text(f"Allowed users: {ids}")
-        return
-
-    if args[0].lower() == "add" and len(args) == 2:
-        try:
-            new_id = int(args[1])
-        except ValueError:
-            await update.message.reply_text("Usage: /whitelist add <numeric_user_id>")
-            return
-        if new_id in allowed:
-            await update.message.reply_text(f"{new_id} is already whitelisted.")
-            return
-        allowed.add(new_id)
-        save_whitelist(allowed)
-        logger.info("Owner added user %s to whitelist", new_id)
-        await update.message.reply_text(f"Added {new_id} to the whitelist.")
-        return
-
-    if args[0].lower() == "remove" and len(args) == 2:
-        try:
-            rm_id = int(args[1])
-        except ValueError:
-            await update.message.reply_text("Usage: /whitelist remove <numeric_user_id>")
-            return
-        if rm_id == owner_id:
-            await update.message.reply_text("Cannot remove the owner from the whitelist.")
-            return
-        allowed.discard(rm_id)
-        save_whitelist(allowed)
-        await update.message.reply_text(f"Removed {rm_id} from the whitelist.")
-        return
-
-    await update.message.reply_text(
-        "Usage:\n"
-        "  /whitelist              — list allowed users\n"
-        "  /whitelist add <id>     — add a user\n"
-        "  /whitelist remove <id>  — remove a user"
-    )
+    removed = notes.pop(index - 1)
+    save_user_memory(user_id, notes)
+    await update.message.reply_text(f"Forgot: {removed.get('text', '')}")
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user or not update.message.text:
-        return
+async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(f"Authorized user ID: {AUTHORIZED_USER_ID}")
 
-    telegram_user_id = update.effective_user.id
-    user_id = f"telegram:{telegram_user_id}"
-    incoming_msg = update.message.text.strip()
 
-    logger.info("Telegram sender ID: %s", telegram_user_id)
+# ---------------------------------------------------------------------------
+# AI news command
+# ---------------------------------------------------------------------------
 
-    if not is_user_allowed(telegram_user_id):
-        await update.message.reply_text("Sorry, you are not authorized to use this bot.")
-        return
-
-    # Show typing indicator immediately so the user knows the bot is working.
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action="typing"
-    )
-
+@_require_auth
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("⏳ Fetching AI news digest…")
     try:
-        needs_search = should_use_web(incoming_msg)
-        if needs_search:
-            # Let the user know a search is running before the slow DDGS call.
-            await context.bot.send_chat_action(
-                chat_id=update.effective_chat.id, action="typing"
-            )
-
-        history = build_messages(user_id, incoming_msg)
-        model_response = ollama.chat(model=MODEL, messages=history)
-
-        reply = model_response["message"]["content"].strip()
-
-        # Store only the clean reply — not web results or metadata.
-        append_assistant_reply(user_id, reply)
-
-        # Run memory extraction in the background so it doesn't add latency.
-        asyncio.create_task(_update_memory_async(user_id, incoming_msg))
-
-        await update.message.reply_text(reply)
-    except Exception:
-        logger.exception("Error while handling Telegram message")
-        await update.message.reply_text("Sorry, something went wrong. Please try again.")
+        digest = await asyncio.get_event_loop().run_in_executor(None, get_ai_news_digest)
+        await update.message.reply_text(digest)
+    except Exception as exc:
+        logger.exception("ai_command failed")
+        await update.message.reply_text(f"❌ Error fetching digest: {exc}")
 
 
-async def _update_memory_async(user_id: str, user_text: str) -> None:
-    """Run memory extraction in a background task to avoid blocking replies."""
-    try:
-        await asyncio.to_thread(update_memory, user_id, user_text)
-    except Exception:
-        logger.exception("Background memory update failed for user %s", user_id)
+# ---------------------------------------------------------------------------
+# Supervisor / build commands
+# ---------------------------------------------------------------------------
 
-async def design_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message:
-        return
-    if not is_user_allowed(update.effective_user.id):
-        await update.message.reply_text("Sorry, you are not authorized.")
-        return
-    request_text = " ".join(context.args).strip() if context.args else ""
-    if not request_text:
-        await update.message.reply_text("Usage: /design <your feature request>")
+@_require_auth
+async def design_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    task = " ".join(context.args) if context.args else ""
+    if not task:
+        await update.message.reply_text("Usage: /design <task description>")
         return
     await update.message.reply_text("Generating design proposal... ⏳")
     proposal_text, status_msg = await supervisor.start_design(
-        update.effective_chat.id, request_text
+        update.effective_chat.id,
+        task,
     )
     if proposal_text is None:
         await update.message.reply_text(status_msg)
         return
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data="approve"),
-        InlineKeyboardButton("❌ Reject", callback_data="reject"),
+    await update.message.reply_text(
+        proposal_text,
+        reply_markup=_design_keyboard(),
+    )
+
+
+@_require_auth
+async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    state = supervisor.load_state().get("state")
+    if state == "AWAITING_COMMIT_APPROVAL":
+        result = await supervisor.approve_commit(_make_notify(context, chat_id))
+    else:
+        result = await supervisor.approve(
+            chat_id,
+            _make_notify(context, chat_id),
+            test_callback=_run_smoke_tests,
+        )
+    await update.message.reply_text(result)
+
+
+@_require_auth
+async def reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    reason = " ".join(context.args) if context.args else "No reason given."
+    result = supervisor.reject(reason)
+    await update.message.reply_text(f"🔄 {result}")
+
+
+@_require_auth
+async def build_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state_info = supervisor.get_status()
+    await update.message.reply_text(state_info)
+
+
+@_require_auth
+async def reset_build_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(supervisor.force_reset())
+
+
+def _design_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data="build:approve"),
+        InlineKeyboardButton("✏️ Revise", callback_data="build:revise"),
+        InlineKeyboardButton("❌ Reject", callback_data="build:reject"),
     ]])
-    await update.message.reply_text(proposal_text, reply_markup=keyboard)
 
 
 def _commit_keyboard() -> InlineKeyboardMarkup:
-    """Inline keyboard shown after a successful build + passing tests."""
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Commit & Push", callback_data="approve_commit"),
-        InlineKeyboardButton("❌ Rollback Build", callback_data="reject_commit"),
+        InlineKeyboardButton("✅ Commit & Push", callback_data="build:commit"),
+        InlineKeyboardButton("❌ Rollback Build", callback_data="build:rollback"),
     ]])
 
 
 def _fix_keyboard() -> InlineKeyboardMarkup:
-    """Inline keyboard shown when Claude has proposed a fix after failing tests."""
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔧 Approve Fix", callback_data="approve_fix"),
-        InlineKeyboardButton("❌ Rollback", callback_data="reject_fix"),
+        InlineKeyboardButton("🔧 Approve Fix", callback_data="build:approve"),
+        InlineKeyboardButton("❌ Rollback", callback_data="build:reject"),
     ]])
 
 
 def _make_notify(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """
-    Return a notify coroutine that attaches the appropriate inline keyboard
-    based on the supervisor's current state.
-      AWAITING_COMMIT_APPROVAL → commit/rollback keyboard
-      AWAITING_FIX_APPROVAL    → approve-fix/rollback keyboard
-    Keeps Telegram UI concerns out of supervisor_loop.py.
-    """
     async def notify(msg: str) -> None:
         state = supervisor.load_state().get("state")
         if state == "AWAITING_COMMIT_APPROVAL":
@@ -546,123 +462,234 @@ def _make_notify(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 
 async def _run_smoke_tests() -> tuple[bool, list]:
-    """
-    Run the in-process smoke test suite and return (all_passed, results).
-    Injected as test_callback into supervisor.approve() so the build pipeline
-    runs tests automatically after every successful build.
-    """
     from tests.telegram_smoke_tester import run_inprocess
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = int(os.environ.get("SMOKE_CHAT_ID", "0"))
     return await run_inprocess(chat_id=chat_id, bot_token=token, send_summary=False)
 
 
-async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message:
+# ---------------------------------------------------------------------------
+# Idea command — multi-turn flow
+# ---------------------------------------------------------------------------
+
+def _idea_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=IdeaFlow.CB_APPROVE),
+            InlineKeyboardButton("✏️ Revise", callback_data=IdeaFlow.CB_REVISE),
+            InlineKeyboardButton("❌ Cancel", callback_data=IdeaFlow.CB_CANCEL),
+        ]
+    ])
+
+
+@_require_auth
+async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _idea_flow
+    topic = " ".join(context.args) if context.args else None
+    _idea_flow.topic = topic or ""
+    _idea_flow.state = IdeaState.PENDING
+
+    await update.message.reply_text("💭 Generating idea…")
+    try:
+        idea_text = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: asyncio.run(generate_idea(topic))  # sync wrapper
+        )
+    except RuntimeError:
+        # Already inside an event loop — use asyncio directly
+        idea_text = await generate_idea(topic)
+    except Exception as exc:
+        logger.exception("idea_command: generate_idea failed")
+        await update.message.reply_text(f"❌ Failed to generate idea: {exc}")
+        _idea_flow.reset()
         return
-    if not is_user_allowed(update.effective_user.id):
-        await update.message.reply_text("Sorry, you are not authorized.")
-        return
-    chat_id = update.effective_chat.id
-    reply = await supervisor.approve(
-        chat_id, _make_notify(context, chat_id), test_callback=_run_smoke_tests
+
+    _idea_flow.last_idea = idea_text
+    await update.message.reply_text(
+        idea_text,
+        parse_mode="Markdown",
+        reply_markup=_idea_keyboard(),
     )
-    await update.message.reply_text(reply)
 
 
-async def reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message:
-        return
-    if not is_user_allowed(update.effective_user.id):
-        await update.message.reply_text("Sorry, you are not authorized.")
-        return
-    reason = " ".join(context.args).strip() if context.args else ""
-    await update.message.reply_text(supervisor.reject(reason))
+# ---------------------------------------------------------------------------
+# Button callback dispatcher
+# ---------------------------------------------------------------------------
 
-
-async def build_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message:
-        return
-    if not is_user_allowed(update.effective_user.id):
-        await update.message.reply_text("Sorry, you are not authorized.")
-        return
-    await update.message.reply_text(supervisor.get_status())
-
-
-async def reset_build_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not update.message:
-        return
-    if not is_user_allowed(update.effective_user.id):
-        await update.message.reply_text("Sorry, you are not authorized.")
-        return
-    await update.message.reply_text(supervisor.force_reset())
-
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not update.effective_user:
         return
     if not is_user_allowed(update.effective_user.id):
         await query.answer("Not authorized.")
         return
-    await query.answer()  # removes the loading spinner on the button
+    await query.answer()
+    data = query.data
+
+    if data == IdeaFlow.CB_APPROVE:
+        await _handle_idea_approve(query, context)
+    elif data == IdeaFlow.CB_REVISE:
+        await _handle_idea_revise(query, context)
+    elif data == IdeaFlow.CB_CANCEL:
+        await _handle_idea_cancel(query, context)
+    elif data == "build:approve":
+        await _handle_build_approve(query, context)
+    elif data == "build:revise":
+        await _handle_build_revise(query, context)
+    elif data == "build:reject":
+        await _handle_build_reject(query, context)
+    elif data == "build:commit":
+        await _handle_build_commit(query, context)
+    elif data == "build:rollback":
+        await _handle_build_rollback(query, context)
+    else:
+        logger.warning("Unknown callback data: %s", data)
+
+
+async def _handle_build_approve(query, context) -> None:
     chat_id = query.message.chat.id
-    data = query.data or ""
+    reply = await supervisor.approve(
+        chat_id,
+        _make_notify(context, chat_id),
+        test_callback=_run_smoke_tests,
+    )
+    await query.edit_message_reply_markup(reply_markup=None)
+    await context.bot.send_message(chat_id=chat_id, text=reply)
 
-    if data == "approve":
-        reply = await supervisor.approve(
-            chat_id, _make_notify(context, chat_id), test_callback=_run_smoke_tests
+
+async def _handle_build_revise(query, context) -> None:
+    reply = supervisor.request_revision()
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(reply)
+
+
+async def _handle_build_reject(query, context) -> None:
+    reply = supervisor.reject("rejected by user")
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(reply)
+
+
+async def _handle_build_commit(query, context) -> None:
+    chat_id = query.message.chat.id
+    reply = await supervisor.approve_commit(_make_notify(context, chat_id))
+    await query.edit_message_reply_markup(reply_markup=None)
+    await context.bot.send_message(chat_id=chat_id, text=reply)
+
+
+async def _handle_build_rollback(query, context) -> None:
+    reply = supervisor.reject_commit()
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(reply)
+
+
+async def _handle_idea_approve(query, context) -> None:
+    global _idea_flow
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        "🚀 Great choice! The idea has been approved.\n\n"
+        "Use /design to start building it, or /idea again for another one."
+    )
+    _idea_flow.reset()
+
+
+async def _handle_idea_revise(query, context) -> None:
+    global _idea_flow
+    _idea_flow.state = IdeaState.REVISING
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(
+        "✏️ Sure! Tell me how you'd like to revise the idea "
+        "(e.g. 'make it simpler', 'focus on AI news', 'add a web dashboard')."
+    )
+
+
+async def _handle_idea_cancel(query, context) -> None:
+    global _idea_flow
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text("❌ Idea cancelled. Use /idea to generate a new one.")
+    _idea_flow.reset()
+
+
+# ---------------------------------------------------------------------------
+# Message handler (free-text, including idea revision)
+# ---------------------------------------------------------------------------
+
+async def _revision_command_intercept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Intercept commands typed while awaiting revision so flow isn't lost."""
+    global _idea_flow
+    if _idea_flow.state == IdeaState.REVISING:
+        # Let the revision handler deal with it as plain text
+        await handle_message(update, context)
+        raise ApplicationHandlerStop
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _idea_flow
+
+    text = update.message.text or ""
+    user_id = f"telegram:{update.effective_user.id}" if update.effective_user else ""
+
+    if not update.effective_user or not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("Sorry, you are not authorized to use this bot.")
+        return
+
+    if supervisor.load_state().get("state") == "AWAITING_REVISION_FEEDBACK":
+        reply = await supervisor.submit_revision_feedback(
+            text,
+            _make_notify(context, update.effective_chat.id),
         )
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(chat_id=chat_id, text=reply)
+        await update.message.reply_text(reply)
+        return
 
-    elif data == "reject":
-        reply = supervisor.reject()
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(chat_id=chat_id, text=reply)
-
-    elif data == "approve_fix":
-        reply = await supervisor.approve(
-            chat_id, _make_notify(context, chat_id), test_callback=_run_smoke_tests
+    # --- Idea revision flow ---
+    if _idea_flow.state == IdeaState.REVISING:
+        revision_note = text
+        topic = _idea_flow.topic
+        combined_topic = f"{topic}. Revision request: {revision_note}" if topic else revision_note
+        await update.message.reply_text("💭 Revising idea…")
+        try:
+            idea_text = await generate_idea(combined_topic)
+        except Exception as exc:
+            logger.exception("handle_message: revision generate_idea failed")
+            await update.message.reply_text(f"❌ Failed to revise: {exc}")
+            _idea_flow.reset()
+            return
+        _idea_flow.last_idea = idea_text
+        _idea_flow.state = IdeaState.PENDING
+        await update.message.reply_text(
+            idea_text,
+            parse_mode="Markdown",
+            reply_markup=_idea_keyboard(),
         )
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(chat_id=chat_id, text=reply)
+        return
 
-    elif data == "reject_fix":
-        reply = supervisor.reject("fix rejected by user")
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(chat_id=chat_id, text=reply)
+    try:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action="typing",
+        )
+        system_prompt, messages = build_messages(user_id, text.strip())
+        reply = await _chat_with_tools(system_prompt, messages)
+        append_assistant_reply(user_id, reply)
+    except Exception as exc:
+        logger.exception("handle_message: Claude call failed")
+        reply = f"❌ Error: {exc}"
 
-    elif data == "approve_commit":
-        reply = await supervisor.approve_commit(_make_notify(context, chat_id))
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(chat_id=chat_id, text=reply)
+    await update.message.reply_text(reply)
 
-    elif data == "reject_commit":
-        reply = supervisor.reject_commit()
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(chat_id=chat_id, text=reply)
 
+# ---------------------------------------------------------------------------
+# Error handler
+# ---------------------------------------------------------------------------
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Global error handler for the Application.
+    if isinstance(context.error, TelegramConflict):
+        logger.warning("Telegram Conflict error — another instance may be running.")
+        return
+    logger.exception("Unhandled exception", exc_info=context.error)
 
-    409 Conflict means a second bot instance is polling the same token.
-    We exit immediately so launchd can restart us cleanly once the other
-    instance has been killed.  All other errors are logged and swallowed
-    so a single bad update cannot crash the bot.
-    """
-    err = context.error
-    if isinstance(err, TelegramConflict):
-        logger.critical(
-            "409 Conflict: another bot instance is polling this token. "
-            "Exiting so launchd can restart cleanly. "
-            "Check for duplicate launchd services or stale processes."
-        )
-        sys.exit(1)
-    logger.error("Unhandled exception in update handler", exc_info=err)
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -680,8 +707,19 @@ def main():
     app.add_handler(CommandHandler("ai", ai_command))
     app.add_handler(CommandHandler("recap", recap_handler))
     app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("remember", remember_command))
+    app.add_handler(CommandHandler("memory", memory_command))
+    app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(CommandHandler("whitelist", whitelist_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Group -1: intercepts command-like text when awaiting revision feedback.
+    # Must be registered after the main handlers so _make_notify closure works,
+    # but the group=-1 argument ensures it runs BEFORE group-0 dispatch.
+    app.add_handler(
+        MessageHandler(filters.COMMAND, _revision_command_intercept),
+        group=-1,
+    )
 
     # Supervisor coding loop
     app.add_handler(CommandHandler("design", design_command))
@@ -689,6 +727,10 @@ def main():
     app.add_handler(CommandHandler("reject", reject_command))
     app.add_handler(CommandHandler("build_status", build_status_command))
     app.add_handler(CommandHandler("reset_build", reset_build_command))
+
+    # Idea generation flow
+    app.add_handler(CommandHandler("idea", idea_command))
+
     app.add_handler(CallbackQueryHandler(button_callback))
 
     logger.info("Telegram bot is running...")

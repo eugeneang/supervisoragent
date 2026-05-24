@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.eugene.smoke_tests</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/eugene/Agents/supervisoragent/run_smoke_tests.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/eugene/Agents/supervisoragent</string>
+
+    <!-- Run once on every load (i.e. after every Mac restart / launchctl load). -->
+    <!-- The script sleeps 45s internally to wait for the bot to be ready.       -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Also run daily at 09:00 SGT = 01:00 UTC. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>1</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Do NOT keep alive — this is a one-shot job, not a persistent service. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/eugene/Agents/smoke_tests.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/eugene/Agents/smoke_tests.error.log</string>
+</dict>
+</plist>

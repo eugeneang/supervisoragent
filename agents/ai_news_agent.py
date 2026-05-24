@@ -1,8 +1,10 @@
 from ddgs import DDGS
-import ollama
+import anthropic
 import time
 
-MODEL = "qwen2.5:7b"
+MODEL = "claude-haiku-4-5-20251001"
+
+_ai_client = anthropic.Anthropic()
 
 
 def fetch_ai_news(max_results=5):
@@ -62,15 +64,14 @@ def summarize_ai_news(results):
         + "\n\n".join(formatted)
     )
 
-    response = ollama.chat(
+    response = _ai_client.messages.create(
         model=MODEL,
-        messages=[
-            {"role": "system", "content": "You are an AI news assistant."},
-            {"role": "user", "content": prompt}
-        ]
+        system="You are an AI news assistant.",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1024,
     )
 
-    return response["message"]["content"].strip()
+    return response.content[0].text.strip()
 
 
 def get_ai_news_digest():

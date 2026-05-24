@@ -270,7 +270,7 @@ class ClaudeBridge:
             "SYSTEM FACTS (always true — never contradict these):\n"
             "- macOS with launchd for service management (NOT supervisord/supervisorctl)\n"
             "- Services managed via launchctl and plists in ~/Library/LaunchAgents/\n"
-            "- Relevant launchd labels: com.eugene.telegram_bot, com.eugene.ollama, "
+            "- Relevant launchd labels: com.eugene.telegram_bot, "
             "com.eugene.smoke_tests, com.eugene.ai_news_push, com.eugene.health_monitor\n"
             "- Smoke test log: /Users/eugene/Agents/smoke_tests.log\n"
             "- Repo root: /Users/eugene/Agents/supervisoragent/\n"
@@ -549,6 +549,70 @@ class ClaudeBridge:
             )
         except Exception as e:
             logger.exception("generate_fix_proposal failed")
+            return ProposalResult(feature_name="unknown", proposal_text="", error=str(e))
+
+    # ── Design revision ──────────────────────────────────────────────────────
+
+    async def revise_proposal(
+        self,
+        request_text: str,
+        current_proposal: str,
+        feedback: str,
+    ) -> ProposalResult:
+        """
+        Generate a revised design proposal given the original request,
+        the previously shown proposal, and the user's revision feedback.
+        Keeps the same FEATURE_NAME so the state machine stays consistent.
+        """
+        system = (
+            "You are a software architect. The user has reviewed a design proposal "
+            "and provided feedback. Revise the proposal to address their feedback.\n\n"
+            "Format your response exactly as follows (include the FEATURE_NAME line):\n\n"
+            "FEATURE_NAME: <same_slug_as_original>\n\n"
+            "## Design Proposal: <human-readable title>\n\n"
+            "**Summary:** one or two sentences.\n\n"
+            "**Files to change:**\n"
+            "- filename.py — what changes\n\n"
+            "**Automated tests to add:**\n"
+            "- tests/telegram_smoke_tester.py — add TestSpec for /<new_command> "
+            "with a pattern matching the expected response text\n\n"
+            "**Constraints respected:**\n"
+            "- list key constraints\n\n"
+            "Keep the proposal under 400 words. Be concrete and specific. "
+            "Address all points in the feedback."
+        )
+        user_content = (
+            f"Original feature request:\n{request_text}\n\n"
+            f"Current design proposal:\n{current_proposal}\n\n"
+            f"User feedback / revision request:\n{feedback}"
+        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.messages.create,
+                    model=MODEL,
+                    max_tokens=1024,
+                    system=[{
+                        "type": "text",
+                        "text": system,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
+                    messages=[{"role": "user", "content": user_content}],
+                ),
+                timeout=DESIGN_TIMEOUT,
+            )
+            raw = response.content[0].text.strip()
+            feature_name, proposal_text = self._parse_proposal(raw, request_text)
+            return ProposalResult(feature_name=feature_name, proposal_text=proposal_text)
+        except asyncio.TimeoutError:
+            logger.error("revise_proposal timed out after %.0fs", DESIGN_TIMEOUT)
+            return ProposalResult(
+                feature_name="unknown",
+                proposal_text="",
+                error=f"Revision timed out after {DESIGN_TIMEOUT:.0f}s",
+            )
+        except Exception as e:
+            logger.exception("revise_proposal failed")
             return ProposalResult(feature_name="unknown", proposal_text="", error=str(e))
 
     def _parse_file_blocks(self, raw: str) -> list[dict]:

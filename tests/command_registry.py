@@ -14,6 +14,10 @@ class CommandSpec:
     description: str                # human-readable description of what is being tested
     timeout_seconds: int = 15       # per-command timeout
     retry_attempts: int = 3         # max retries on failure
+    # Optional cleanup: sent after a PASSING test to restore bot state.
+    # e.g. send /reject after /design to avoid leaving AWAITING_APPROVAL state.
+    cleanup_command: Optional[str] = None
+    cleanup_pattern: Optional[re.Pattern] = None
 
 
 # Commands that must NEVER be executed by the test agent.
@@ -29,12 +33,6 @@ SKIP_COMMANDS: set[str] = {
 
 # All testable commands ordered from safest to most complex.
 COMMAND_REGISTRY: list[CommandSpec] = [
-    CommandSpec(
-        command="/start",
-        args="",
-        pattern=re.compile(r"hello", re.IGNORECASE),
-        description="Bot greeting on /start",
-    ),
     CommandSpec(
         command="/ping",
         args="",
@@ -54,10 +52,24 @@ COMMAND_REGISTRY: list[CommandSpec] = [
         description="/id echoes the caller's user ID",
     ),
     CommandSpec(
+        command="/start",
+        args="",
+        pattern=re.compile(r"hello", re.IGNORECASE),
+        description="Bot greeting on /start",
+    ),
+    CommandSpec(
         command="/build_status",
         args="",
         pattern=re.compile(r"state|IDLE|build|status", re.IGNORECASE),
         description="Build status shows current supervisor state",
+    ),
+    CommandSpec(
+        command="/ai",
+        args="",
+        pattern=re.compile(r"AI|news|digest|model|openai|anthropic|summary", re.IGNORECASE),
+        description="/ai fetches and returns an AI news digest",
+        timeout_seconds=45,   # fetches external news + runs LLM summary
+        retry_attempts=2,
     ),
     CommandSpec(
         command="/design",
@@ -67,8 +79,12 @@ COMMAND_REGISTRY: list[CommandSpec] = [
             re.IGNORECASE,
         ),
         description="/design generates a structured design proposal",
-        timeout_seconds=60,   # LLM generation can take longer
+        timeout_seconds=90,   # cold Claude API can be slow
         retry_attempts=2,
+        # Cleanup: /reject resets supervisor to IDLE after the proposal is generated.
+        # Without this the bot stays in AWAITING_APPROVAL and blocks the next /design.
+        cleanup_command="/reject smoke-test cleanup",
+        cleanup_pattern=re.compile(r"Reset to IDLE|Nothing in progress", re.IGNORECASE),
     ),
 ]
 

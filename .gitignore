@@ -26,6 +26,7 @@ config.local.json
 secrets.json
 conversation_store.json
 structured_memory.json
+memory_store.json
 whitelist.json
 
 # launchd / runtime

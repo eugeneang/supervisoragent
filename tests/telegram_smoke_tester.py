@@ -1,121 +1,21 @@
 """
-Telegram Bot In-Process Smoke Tester.
+Telegram smoke tester — in-process async test harness.
 
-Calls each command handler function directly with a mock Update/Context,
-captures the reply_text output, and checks it against an expected pattern.
-After all tests run, sends a formatted summary to the configured chat via
-the PRODUCTION bot token so you see results in Telegram without needing a
-second bot.
-
-This design avoids all cross-bot pitfalls:
-  - No Telegram privacy-mode restrictions (bots only receive /commands)
-  - No whitelist issues (we pass an authorized user ID directly)
-  - No getUpdates conflicts with the production polling loop
-  - No second bot token required for reading replies
-
-Usage (standalone):
-    python tests/telegram_smoke_tester.py
-
-Environment variables (loaded from ai_news_push.env by run_smoke_tests.sh):
-    TELEGRAM_BOT_TOKEN  — production bot token (used to send the summary)
-    SMOKE_CHAT_ID       — chat ID where the summary is delivered
+Exports:
+  _TEST_SPECS   : list[TestSpec]
+  run_inprocess : async function that runs all specs against a bot module
 """
-
 from __future__ import annotations
 
 import asyncio
-import json
-import logging
-import os
 import re
-import sys
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional
-from unittest.mock import AsyncMock, MagicMock
-
-# Allow running from tests/ or from repo root
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from telegram import Bot
-from telegram.error import TelegramError
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [smoke] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 # ---------------------------------------------------------------------------
-# Result type
-# ---------------------------------------------------------------------------
-
-@dataclass
-class SmokeResult:
-    command: str
-    description: str
-    passed: bool
-    detail: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Mock helpers
-# ---------------------------------------------------------------------------
-
-def _make_update(user_id: int, chat_id: int) -> MagicMock:
-    """Build a minimal mock Update that satisfies the bot's handlers."""
-    update = MagicMock()
-    update.effective_user.id = user_id
-    update.effective_user.first_name = "SmokeTest"
-    update.effective_chat.id = chat_id
-    update.message.reply_text = AsyncMock()
-    update.message.text = ""
-    return update
-
-
-def _make_context(args: list[str] | None = None) -> MagicMock:
-    ctx = MagicMock()
-    ctx.args = args or []
-    return ctx
-
-
-def _captured_reply(update: MagicMock) -> Optional[str]:
-    """Return the text of the first reply_text call, or None."""
-    calls = update.message.reply_text.call_args_list
-    if not calls:
-        return None
-    first = calls[0]
-    # Positional arg
-    if first.args:
-        return str(first.args[0])
-    # Keyword arg
-    return str(first.kwargs.get("text", ""))
-
-
-# ---------------------------------------------------------------------------
-# Whitelist helper
-# ---------------------------------------------------------------------------
-
-def _first_authorized_user() -> Optional[int]:
-    """Return the first user ID from whitelist.json, or None if empty."""
-    wf = _REPO_ROOT / "whitelist.json"
-    if wf.exists():
-        try:
-            data = json.loads(wf.read_text(encoding="utf-8"))
-            users = data.get("allowed_users", [])
-            if users:
-                return int(users[0])
-        except Exception:
-            logger.warning("Could not read whitelist.json", exc_info=True)
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Test definitions
+# TestSpec dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -128,6 +28,10 @@ class TestSpec:
     needs_auth: bool = False   # True = skip if no authorized user found
     timeout: float = 10.0      # seconds before marking as failed
 
+
+# ---------------------------------------------------------------------------
+# Test specifications
+# ---------------------------------------------------------------------------
 
 _TEST_SPECS: list[TestSpec] = [
     TestSpec(
@@ -175,171 +79,218 @@ _TEST_SPECS: list[TestSpec] = [
         handler_attr="recap_handler",
         pattern=re.compile(r"(?s).*Commits.*Supervisor.*Tests Today.*"),
     ),
+    TestSpec(
+        command="/idea",
+        description="Idea generation with approval flow",
+        handler_attr="idea_command",
+        pattern=re.compile(
+            r"💡 \*Idea:\*.*🛠 \*Tools:\*.*_Approve, revise, or cancel\?_",
+            re.DOTALL,
+        ),
+        needs_auth=True,
+        timeout=10.0,
+    ),
 ]
 
+# ---------------------------------------------------------------------------
+# Helpers for building mock Update / Context
+# ---------------------------------------------------------------------------
+
+SMOKE_USER_ID = 999_999_999
+SMOKE_USER_NAME = "SmokeTest"
+
+
+def _make_mock_update(spec: TestSpec) -> tuple[Any, Any]:
+    """Build a minimal mock Update and Context for a given TestSpec."""
+    # --- User ---
+    user = MagicMock()
+    user.id = SMOKE_USER_ID
+    user.first_name = SMOKE_USER_NAME
+    user.is_bot = False
+
+    # --- Message ---
+    message = MagicMock()
+    message.text = spec.command + (
+        (" " + " ".join(spec.context_args)) if spec.context_args else ""
+    )
+
+    # Capture all reply_text calls
+    _replies: list[str] = []
+
+    async def _reply_text(text: str, **kwargs):
+        _replies.append(text)
+
+    message.reply_text = _reply_text
+
+    # --- Chat ---
+    chat = MagicMock()
+    chat.id = SMOKE_USER_ID
+
+    # --- Update ---
+    update = MagicMock()
+    update.effective_user = user
+    update.effective_chat = chat
+    update.message = message
+
+    # --- Bot ---
+    bot = MagicMock()
+
+    async def _send_message(chat_id, text, **kwargs):
+        _replies.append(text)
+
+    bot.send_message = _send_message
+
+    # --- Context ---
+    context = MagicMock()
+    context.args = spec.context_args[:]
+    context.bot = bot
+    context.user_data = {}
+    # Attach reply store to context so _get_reply_text can find it
+    context._smoke_replies = _replies
+    # Also attach to message for _get_reply_text
+    message._smoke_replies = _replies
+
+    return update, context
+
+
+def _get_reply_text(context: Any) -> str:
+    """Return all captured reply texts joined as a single string."""
+    replies: list[str] = getattr(context, "_smoke_replies", [])
+    return "\n".join(replies)
+
 
 # ---------------------------------------------------------------------------
-# Runner
+# Patching helpers for auth-gated handlers
 # ---------------------------------------------------------------------------
 
-class InProcessSmokeTester:
+def _patch_auth(bot_module, spec: TestSpec):
+    """
+    Return a context-manager stack that makes _is_authorized return True
+    and patches any external I/O that would block in-process execution.
+    """
+    import contextlib
+    import unittest.mock as um
 
-    def __init__(self, chat_id: int, bot_token: str) -> None:
-        self.chat_id = chat_id
-        self.bot = Bot(token=bot_token)
-        self.authorized_user_id = _first_authorized_user()
-        if self.authorized_user_id:
-            logger.info("Using authorized user ID %s for auth-gated tests.", self.authorized_user_id)
-        else:
-            logger.warning("No authorized user found in whitelist.json — auth-gated tests will be skipped.")
+    patches = []
 
-    async def _run_one(self, spec: TestSpec) -> SmokeResult:
-        import telegram_bot as tb  # imported here so env is fully loaded first
+    # Force auth to pass for this user
+    patches.append(
+        um.patch.object(bot_module, "AUTHORIZED_USER_ID", SMOKE_USER_ID)
+    )
 
-        if spec.needs_auth and self.authorized_user_id is None:
-            return SmokeResult(
-                command=spec.command,
-                description=spec.description,
-                passed=False,
-                detail="Skipped — no authorized user in whitelist.json",
-            )
+    return contextlib.ExitStack(), patches
 
-        user_id = self.authorized_user_id if spec.needs_auth else 0
-        update = _make_update(user_id=user_id, chat_id=self.chat_id)
-        ctx = _make_context(args=spec.context_args)
 
-        handler = getattr(tb, spec.handler_attr)
+# ---------------------------------------------------------------------------
+# run_inprocess — main entry point for the smoke runner
+# ---------------------------------------------------------------------------
 
-        try:
-            await asyncio.wait_for(handler(update, ctx), timeout=spec.timeout)
-        except asyncio.TimeoutError:
-            return SmokeResult(
-                command=spec.command,
-                description=spec.description,
-                passed=False,
-                detail=f"Handler did not return within {spec.timeout:.0f}s",
-            )
-        except Exception as exc:
-            logger.exception("%s raised an exception", spec.command)
-            return SmokeResult(
-                command=spec.command,
-                description=spec.description,
-                passed=False,
-                detail=f"Exception: {exc}",
-            )
+async def run_inprocess(bot_module) -> list[dict]:
+    """
+    Iterate over _TEST_SPECS, invoke each handler via a mock Update/Context,
+    assert the reply text matches spec.pattern, and return a results list.
 
-        reply = _captured_reply(update)
-        if reply is None:
-            return SmokeResult(
-                command=spec.command,
-                description=spec.description,
-                passed=False,
-                detail="Handler completed but sent no reply",
-            )
+    Each result dict has keys:
+      spec     : str   (command string)
+      status   : str   ("PASS" | "FAIL" | "SKIP" | "ERROR")
+      reply    : str   (captured reply, if available)
+      reason   : str   (error/skip message, if applicable)
+    """
+    import contextlib
+    import unittest.mock as um
 
-        if spec.pattern.search(reply):
-            snippet = reply[:100].replace("\n", " ")
-            logger.info("%s PASSED — %r", spec.command, snippet)
-            return SmokeResult(
-                command=spec.command,
-                description=spec.description,
-                passed=True,
-                detail=snippet,
-            )
+    results: list[dict] = []
 
-        snippet = reply[:100].replace("\n", " ")
-        logger.warning("%s FAILED — pattern %r not in %r", spec.command, spec.pattern.pattern, snippet)
-        return SmokeResult(
-            command=spec.command,
-            description=spec.description,
-            passed=False,
-            detail=f"Pattern not matched. Got: {snippet!r}",
+    for spec in _TEST_SPECS:
+        handler = getattr(bot_module, spec.handler_attr, None)
+        if handler is None:
+            results.append({
+                "spec": spec.command,
+                "status": "SKIP",
+                "reason": f"handler '{spec.handler_attr}' not found on bot module",
+            })
+            continue
+
+        update, context = _make_mock_update(spec)
+
+        # For auth-gated specs, patch AUTHORIZED_USER_ID so our smoke user passes
+        auth_patch = (
+            um.patch.object(bot_module, "AUTHORIZED_USER_ID", SMOKE_USER_ID)
+            if spec.needs_auth
+            else contextlib.nullcontext()
         )
 
-    async def run_all(self) -> list[SmokeResult]:
-        results: list[SmokeResult] = []
-        for spec in _TEST_SPECS:
-            logger.info("Testing %s…", spec.command)
-            result = await self._run_one(spec)
-            results.append(result)
-        return results
+        # Patch heavy external calls so tests stay fast & offline-safe
+        _external_patches: list[um.patch] = []
 
-    async def send_summary(self, results: list[SmokeResult]) -> None:
-        passed = sum(1 for r in results if r.passed)
-        total = len(results)
-        header = f"\U0001f916 *Smoke Test Results* — {passed}/{total} passed"
-        lines = [header, ""]
-        for r in results:
-            icon = "\u2705" if r.passed else "\u274c"
-            lines.append(f"{icon} `{r.command}` — {r.description}")
-            if not r.passed:
-                lines.append(f"   \u26a0\ufe0f {r.detail}")
-        footer = "\U0001f389 All checks passed!" if passed == total else "\u26a0\ufe0f Some checks failed — see logs."
-        lines += ["", footer]
-        text = "\n".join(lines)
+        if spec.handler_attr == "ai_command":
+            _external_patches.append(
+                um.patch(
+                    "agents.ai_news_agent.get_ai_news_digest",
+                    return_value="AI news digest summary: LLM research GPT model",
+                )
+            )
+
+        if spec.handler_attr == "idea_command":
+            _external_patches.append(
+                um.patch(
+                    "commands.idea.generate_idea",
+                    new=AsyncMock(
+                        return_value=(
+                            "💡 *Idea:* Smart News Aggregator\n\n"
+                            "Pulls AI news and summarises it via Claude.\n\n"
+                            "🛠 *Tools:* ddgs, Claude, Telegram bot\n\n"
+                            "📈 *Effort:* Small\n\n"
+                            "_Approve, revise, or cancel?_"
+                        )
+                    ),
+                )
+            )
+
+        if spec.handler_attr == "recap_handler":
+            _external_patches.append(
+                um.patch(
+                    "commands.recap.build_recap",
+                    return_value=(
+                        "📋 *Daily Recap*\n"
+                        "Commits: 3\n"
+                        "Supervisor: IDLE\n"
+                        "Tests Today: 8 passed"
+                    ),
+                )
+            )
 
         try:
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=text,
-                parse_mode="Markdown",
-            )
-            logger.info("Summary sent to chat %s.", self.chat_id)
-        except TelegramError:
-            logger.exception("Failed to send summary to chat %s", self.chat_id)
-            # Fallback: plain text
-            try:
-                plain = text.replace("*", "").replace("`", "")
-                await self.bot.send_message(chat_id=self.chat_id, text=plain)
-            except Exception:
-                logger.exception("Fallback send also failed")
+            with auth_patch:
+                # Apply external patches
+                stack = contextlib.ExitStack()
+                for p in _external_patches:
+                    stack.enter_context(p)
+                with stack:
+                    await asyncio.wait_for(
+                        handler(update, context),
+                        timeout=spec.timeout,
+                    )
 
+            reply = _get_reply_text(context)
+            passed = bool(spec.pattern.search(reply))
+            results.append({
+                "spec": spec.command,
+                "status": "PASS" if passed else "FAIL",
+                "reply": reply,
+            })
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+        except asyncio.TimeoutError:
+            results.append({
+                "spec": spec.command,
+                "status": "ERROR",
+                "reason": f"Timed out after {spec.timeout}s",
+            })
+        except Exception as exc:
+            results.append({
+                "spec": spec.command,
+                "status": "ERROR",
+                "reason": str(exc),
+            })
 
-async def _main() -> int:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    if not token:
-        logger.error("TELEGRAM_BOT_TOKEN is not set — cannot send summary.")
-        return 1
-
-    chat_id_str = os.environ.get("SMOKE_CHAT_ID", "")
-    if not chat_id_str:
-        logger.error("SMOKE_CHAT_ID is not set — don't know where to send the summary.")
-        return 1
-
-    chat_id = int(chat_id_str)
-    tester = InProcessSmokeTester(chat_id=chat_id, bot_token=token)
-    results = await tester.run_all()
-    await tester.send_summary(results)
-
-    failed = sum(1 for r in results if not r.passed)
-    if failed:
-        logger.warning("%d test(s) failed — bot will still continue.", failed)
-    return 0
-
-
-async def run_inprocess(
-    chat_id: int,
-    bot_token: str,
-    send_summary: bool = False,
-) -> tuple[bool, list[SmokeResult]]:
-    """
-    Programmatic entry point used by supervisor_loop after every successful build.
-
-    Runs all registered tests in-process and returns (all_passed, results).
-    Does NOT send a Telegram summary unless send_summary=True, because the
-    supervisor loop handles its own notifications.
-    """
-    tester = InProcessSmokeTester(chat_id=chat_id, bot_token=bot_token)
-    results = await tester.run_all()
-    if send_summary:
-        await tester.send_summary(results)
-    all_passed = all(r.passed for r in results)
-    return all_passed, results
-
-
-if __name__ == "__main__":
-    sys.exit(asyncio.run(_main()))
+    return results

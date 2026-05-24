@@ -90,6 +90,9 @@ _DEFAULT_STATE: dict = {
     "test_results": [],          # list of {command, passed, detail} dicts
     "fix_proposal_text": None,   # Claude's fix proposal after test failure
     "fix_attempt": 0,            # number of fix iterations attempted so far
+    # Revision fields
+    "revision_count": 0,         # how many design revisions have been done
+    "revision_feedback": None,   # last feedback text from user
     "created_at": None,
     "updated_at": None,
 }
@@ -99,6 +102,7 @@ _DEFAULT_STATE: dict = {
 _ACTIVE_STATES = frozenset({
     "DESIGNING",
     "AWAITING_APPROVAL",
+    "AWAITING_REVISION_FEEDBACK",
     "BUILDING",
     "TESTING",
     "AWAITING_FIX_APPROVAL",
@@ -108,6 +112,9 @@ _ACTIVE_STATES = frozenset({
 
 # Maximum automated fix iterations before requiring manual intervention.
 MAX_FIX_ATTEMPTS = 2
+
+# Maximum design revision rounds before hiding the Revise button.
+MAX_REVISIONS = 3
 
 
 class SupervisorLoop:
@@ -314,6 +321,89 @@ class SupervisorLoop:
             })
             self.save_state(state)
             return result.proposal_text, "Proposal ready."
+
+    # ── Design revision ──────────────────────────────────────────────────────
+
+    def request_revision(self) -> str:
+        """
+        Transition AWAITING_APPROVAL → AWAITING_REVISION_FEEDBACK.
+        Returns the prompt string to send to the user.
+        """
+        state = self.load_state()
+        if state["state"] != "AWAITING_APPROVAL":
+            return f"Nothing to revise right now (state: {state['state']})."
+        revision_count = state.get("revision_count", 0)
+        if revision_count >= MAX_REVISIONS:
+            return f"Maximum revisions ({MAX_REVISIONS}) reached. Please approve or reject."
+        state["state"] = "AWAITING_REVISION_FEEDBACK"
+        self.save_state(state)
+        return (
+            "What would you like changed? Type your feedback and I'll revise the design.\n"
+            f"(Revision {revision_count + 1}/{MAX_REVISIONS})"
+        )
+
+    async def submit_revision_feedback(
+        self, feedback: str, notify_callback
+    ) -> str:
+        """
+        Accept feedback text and kick off a revised proposal in the background.
+        Returns an acknowledgement string.
+        """
+        async with self._lock:
+            state = self.load_state()
+            if state["state"] != "AWAITING_REVISION_FEEDBACK":
+                return f"Not waiting for revision feedback (state: {state['state']})."
+            state["state"] = "DESIGNING"
+            state["revision_feedback"] = feedback
+            self.save_state(state)
+
+        asyncio.create_task(self._run_revision(feedback, notify_callback))
+        return "Generating revised design... ⏳"
+
+    async def _run_revision(self, feedback: str, notify_callback) -> None:
+        async with self._lock:
+            state = self.load_state()
+            request_text = state.get("request_text", "")
+            current_proposal = state.get("proposal_text", "")
+            feature_name = state.get("feature_name", "feature")
+            revision_count = state.get("revision_count", 0)
+
+        try:
+            result = await self._get_bridge().revise_proposal(
+                request_text=request_text,
+                current_proposal=current_proposal,
+                feedback=feedback,
+            )
+        except Exception as e:
+            logger.exception("Unexpected exception in _run_revision")
+            result = type("R", (), {"error": str(e), "proposal_text": "", "feature_name": feature_name})()
+
+        async with self._lock:
+            state = self.load_state()
+            if result.error:
+                state.update({"state": "IDLE", "error": result.error})
+                self.save_state(state)
+                try:
+                    await notify_callback(f"Failed to generate revised proposal:\n{result.error}")
+                except Exception:
+                    logger.exception("notify_callback failed after revision error")
+                return
+            state.update({
+                "state": "AWAITING_APPROVAL",
+                "proposal_text": result.proposal_text,
+                "feature_name": result.feature_name or feature_name,
+                "revision_count": revision_count + 1,
+            })
+            self.save_state(state)
+            new_count = revision_count + 1
+
+        try:
+            await notify_callback(
+                f"Revised design (revision {new_count}/{MAX_REVISIONS}):\n\n"
+                f"{result.proposal_text}"
+            )
+        except Exception:
+            logger.exception("notify_callback failed after revision ready")
 
     # ── /approve ─────────────────────────────────────────────────────────────
 

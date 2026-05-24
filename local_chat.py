@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
-import ollama
+import anthropic
 
-MODEL = "qwen2.5:7b"
+MODEL = "claude-haiku-4-5-20251001"
 
 CONVERSATION_FILE = Path("conversation_store.json")
 MEMORY_FILE = Path("structured_memory.json")
@@ -19,6 +19,8 @@ Always use this memory when responding.
 
 If user shares new preferences or personal facts, remember them.
 """
+
+_ai_client = anthropic.Anthropic()
 
 
 # ---------- Load / Save Helpers ----------
@@ -39,13 +41,9 @@ def save_json(path, data):
 
 def get_conversation(user_id):
     store = load_json(CONVERSATION_FILE)
-
-    if user_id not in store:
-        store[user_id] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-
-    return store, store[user_id]
+    # Strip legacy system messages — system prompt is injected at call time
+    history = [m for m in store.get(user_id, []) if m.get("role") != "system"]
+    return store, history
 
 
 def save_conversation(store):
@@ -53,9 +51,7 @@ def save_conversation(store):
 
 
 def trim_history(history, max_messages=10):
-    if len(history) <= max_messages:
-        return history
-    return [history[0]] + history[-(max_messages - 1):]
+    return history[-max_messages:]
 
 
 # ---------- Structured Memory ----------
@@ -80,7 +76,6 @@ def save_memory(memory):
 # ---------- Extract New Facts ----------
 
 def update_memory(user_id, user_text, reply):
-
     memory, user_memory = get_memory(user_id)
 
     extract_prompt = f"""
@@ -99,16 +94,21 @@ Return JSON only like:
 Only include new information.
 """
 
-    response = ollama.chat(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": "You extract structured user memory."},
-            {"role": "user", "content": extract_prompt}
-        ]
-    )
-
     try:
-        extracted = json.loads(response["message"]["content"])
+        response = _ai_client.messages.create(
+            model=MODEL,
+            system="You extract structured user memory. Reply with JSON only.",
+            messages=[{"role": "user", "content": extract_prompt}],
+            max_tokens=512,
+        )
+
+        content = response.content[0].text.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.strip()
+        extracted = json.loads(content)
 
         user_memory["profile"].update(extracted.get("profile", {}))
         user_memory["facts"].update(extracted.get("facts", {}))
@@ -120,45 +120,35 @@ Only include new information.
         memory[user_id] = user_memory
         save_memory(memory)
 
-    except:
+    except Exception:
         pass
 
 
 # ---------- Chat ----------
 
 def chat(user_id, user_text):
-
     store, history = get_conversation(user_id)
-
     memory, user_memory = get_memory(user_id)
 
     memory_text = json.dumps(user_memory, indent=2)
 
     history.append({
         "role": "user",
-        "content": f"""
-User Memory:
-{memory_text}
-
-User message:
-{user_text}
-"""
+        "content": f"User Memory:\n{memory_text}\n\nUser message:\n{user_text}"
     })
 
     history = trim_history(history)
 
-    response = ollama.chat(
+    response = _ai_client.messages.create(
         model=MODEL,
-        messages=history
+        system=SYSTEM_PROMPT,
+        messages=history,
+        max_tokens=1024,
     )
 
-    reply = response["message"]["content"]
+    reply = response.content[0].text
 
-    history.append({
-        "role": "assistant",
-        "content": reply
-    })
-
+    history.append({"role": "assistant", "content": reply})
     store[user_id] = history
     save_conversation(store)
 
@@ -170,13 +160,11 @@ User message:
 # ---------- Main ----------
 
 def main():
-
     user_id = input("Enter user id: ").strip() or "default-user"
 
     print("Type 'exit' to quit.\n")
 
     while True:
-
         user_text = input("You: ").strip()
 
         if user_text.lower() == "exit":
