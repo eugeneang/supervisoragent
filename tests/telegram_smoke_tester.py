@@ -80,6 +80,13 @@ _TEST_SPECS: list[TestSpec] = [
         pattern=re.compile(r"(?s).*Commits.*Supervisor.*Tests Today.*"),
     ),
     TestSpec(
+        command="/ops",
+        description="Operational status dashboard",
+        handler_attr="ops_handler",
+        pattern=re.compile(r"Ops Status.*Telegram Bot.*AI News.*Git", re.IGNORECASE | re.DOTALL),
+        needs_auth=True,
+    ),
+    TestSpec(
         command="/idea",
         description="Idea generation with approval flow",
         handler_attr="idea_command",
@@ -256,6 +263,19 @@ async def run_inprocess(bot_module) -> list[dict]:
                         "Commits: 3\n"
                         "Supervisor: IDLE\n"
                         "Tests Today: 8 passed"
+                    ),
+                )
+            )
+
+        if spec.handler_attr == "ops_handler":
+            _external_patches.append(
+                um.patch(
+                    "commands.ops.build_ops_report",
+                    return_value=(
+                        "Ops Status\n\n"
+                        "Telegram Bot\n"
+                        "AI News\n"
+                        "Git"
                     ),
                 )
             )
