@@ -87,6 +87,13 @@ _TEST_SPECS: list[TestSpec] = [
         needs_auth=True,
     ),
     TestSpec(
+        command="/logs",
+        description="Recent sanitized service logs",
+        handler_attr="logs_handler",
+        pattern=re.compile(r"Logs: bot.*Application started", re.IGNORECASE | re.DOTALL),
+        needs_auth=True,
+    ),
+    TestSpec(
         command="/idea",
         description="Idea generation with approval flow",
         handler_attr="idea_command",
@@ -277,6 +284,14 @@ async def run_inprocess(bot_module) -> list[dict]:
                         "AI News\n"
                         "Git"
                     ),
+                )
+            )
+
+        if spec.handler_attr == "logs_handler":
+            _external_patches.append(
+                um.patch(
+                    "commands.logs.build_logs_report",
+                    return_value="Logs: bot\n\nApplication started",
                 )
             )
 

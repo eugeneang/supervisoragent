@@ -27,6 +27,7 @@ from supervisor_loop import SupervisorLoop
 from commands.ping import ping_command
 from commands.recap import recap_handler
 from commands.ops import ops_handler
+from commands.logs import logs_handler
 from commands.idea import generate_idea
 from flows.idea_flow import IdeaFlow, IdeaState
 
@@ -257,6 +258,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/ai — AI news digest\n"
         "/recap — daily activity summary\n"
         "/ops — operational status dashboard\n"
+        "/logs [service] [lines] — show recent sanitized logs\n"
         "/remember <key> <value> — store a memory\n"
         "/memory — list all memories\n"
         "/forget <key> — remove a memory\n"
@@ -709,6 +711,7 @@ def main():
     app.add_handler(CommandHandler("ai", ai_command))
     app.add_handler(CommandHandler("recap", recap_handler))
     app.add_handler(CommandHandler("ops", ops_handler))
+    app.add_handler(CommandHandler("logs", logs_handler))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("remember", remember_command))
     app.add_handler(CommandHandler("memory", memory_command))
