@@ -49,7 +49,8 @@ def send_text(text: str) -> None:
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        # The endpoint is a fixed HTTPS Telegram API URL.
+        with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310
             body = json.loads(resp.read().decode())
             if not body.get("ok"):
                 print(f"telegram_notify: API ok=false {body}", file=sys.stderr)

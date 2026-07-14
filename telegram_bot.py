@@ -30,6 +30,14 @@ from commands.ops import ops_handler
 from commands.logs import logs_handler
 from commands.idea import generate_idea
 from flows.idea_flow import IdeaFlow, IdeaState
+from network_guardian import (
+    GuardianScheduler,
+    GuardianStore,
+    NetworkCollector,
+    NetworkGuardian,
+    SpeedTestRunner,
+    parse_service_targets,
+)
 
 from ddgs import DDGS
 
@@ -41,6 +49,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# httpx includes full Telegram API URLs (and therefore the bot token) at INFO.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Config / constants
@@ -48,13 +58,25 @@ logger = logging.getLogger(__name__)
 import config
 
 AUTHORIZED_USER_ID: int | None = getattr(config, "AUTHORIZED_USER_ID", None)
-MEMORY_FILE: Path = Path(getattr(config, "MEMORY_FILE", "/tmp/bot_memory.json"))
+MEMORY_FILE: Path = Path(
+    getattr(config, "MEMORY_FILE", Path.home() / ".local/state/supervisoragent/memory.json")
+)
 WHITELIST_FILE = Path("whitelist.json")
 AUTO_WHITELIST_LIMIT = 2
 CONVERSATION_FILE = Path("conversation_store.json")
 MEMORY_STORE_FILE = Path("memory_store.json")
 CHAT_MODEL = "claude-haiku-4-5-20251001"
 _SGT = ZoneInfo("Asia/Singapore")
+
+_GUARDIAN_STATE_FILE = Path(
+    os.getenv("NETWORK_GUARDIAN_STATE_FILE", str(Path(__file__).parent / "network_guardian_state.json"))
+)
+_guardian = NetworkGuardian(
+    GuardianStore(_GUARDIAN_STATE_FILE),
+    NetworkCollector(parse_service_targets(os.getenv("NETWORK_GUARDIAN_TARGETS"))),
+)
+_speed_test_runner = SpeedTestRunner()
+_guardian_scheduler: GuardianScheduler | None = None
 
 supervisor = SupervisorLoop()
 
@@ -238,6 +260,56 @@ def _require_auth(func):
 # Basic commands
 # ---------------------------------------------------------------------------
 
+HELP_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("General", (
+        ("start", "greet you and introduce the bot"),
+        ("help", "list every available command and what it does"),
+        ("ping", "check whether the bot is responding"),
+        ("id", "show your Telegram user ID"),
+    )),
+    ("Assistant & memory", (
+        ("ai", "generate the latest AI news digest"),
+        ("recap", "summarize recent commits, services, and tests"),
+        ("remember <note>", "save a personal memory"),
+        ("memory", "list saved memories"),
+        ("forget <number>", "delete one saved memory"),
+        ("clear [all]", "clear chat context; 'all' also clears memories"),
+    )),
+    ("Operations", (
+        ("ops", "show the operational status dashboard"),
+        ("logs [service] [lines]", "show recent sanitized service logs"),
+        ("whitelist", "show the configured authorized user ID"),
+    )),
+    ("Supervised building", (
+        ("design <task>", "design and start a supervised coding task"),
+        ("approve", "approve the current build or commit stage"),
+        ("reject [reason]", "reject the current build stage"),
+        ("build_status", "show the supervisor state"),
+        ("reset_build", "reset the supervisor to IDLE"),
+        ("idea [topic]", "generate a project idea with approval controls"),
+    )),
+    ("Network Guardian (read-only)", (
+        ("net_status", "show network health and guardian status"),
+        ("net_devices", "list devices observed on the local network"),
+        ("net_scan", "run a read-only network observation now"),
+        ("net_alerts", "show recent network alerts"),
+        ("net_summary", "generate the daily network summary now"),
+        ("net_speed", "run and record an internet quality test now"),
+        ("net_actions", "list intrusive actions awaiting approval"),
+        ("net_approve <id>", "approve a proposed action; execution remains safety-gated"),
+        ("net_reject <id>", "reject a proposed action without changing the network"),
+    )),
+)
+
+
+def _help_text() -> str:
+    lines = ["📚 Available commands"]
+    for heading, commands in HELP_SECTIONS:
+        lines.extend(("", heading))
+        lines.extend(f"/{command} — {description}" for command, description in commands)
+    lines.extend(("", "You can also send a normal message to chat with the assistant."))
+    return "\n".join(lines)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = update.effective_user.first_name or "there"
     await update.message.reply_text(f"Hello, {name}! I'm your agent bot. Type /help to see what I can do.")
@@ -249,29 +321,89 @@ async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "Available commands:\n"
-        "/ping — liveness check\n"
-        "/id — show your Telegram user ID\n"
-        "/start — greeting\n"
-        "/help — this message\n"
-        "/ai — AI news digest\n"
-        "/recap — daily activity summary\n"
-        "/ops — operational status dashboard\n"
-        "/logs [service] [lines] — show recent sanitized logs\n"
-        "/remember <key> <value> — store a memory\n"
-        "/memory — list all memories\n"
-        "/forget <key> — remove a memory\n"
-        "/clear — clear conversation context\n"
-        "/whitelist — show authorized user ID\n"
-        "/design <task> — start a supervised coding task\n"
-        "/approve — approve current build\n"
-        "/reject — reject current build\n"
-        "/build_status — show supervisor state\n"
-        "/reset_build — reset supervisor to IDLE\n"
-        "/idea [topic] — generate a project idea\n"
+    await update.message.reply_text(_help_text())
+
+
+# ---------------------------------------------------------------------------
+# Network Guardian commands
+# ---------------------------------------------------------------------------
+
+@_require_auth
+async def net_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(_guardian.status_text())
+
+
+@_require_auth
+async def net_devices_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(_guardian.devices_text())
+
+
+@_require_auth
+async def net_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("🔎 Running a read-only network observation…")
+    alerts = await _guardian.scan()
+    suffix = f"\nNew alerts: {len(alerts)}" if alerts else "\nNo new alerts."
+    await update.message.reply_text(_guardian.status_text() + suffix)
+
+
+@_require_auth
+async def net_alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(_guardian.alerts_text())
+
+
+@_require_auth
+async def net_summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(_guardian.summary_text(datetime.now(_SGT)))
+
+
+@_require_auth
+async def net_speed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📶 Running an ad-hoc network quality test. This may briefly use most available bandwidth…"
     )
-    await update.message.reply_text(text)
+    result = await asyncio.to_thread(_speed_test_runner.run, datetime.now(_SGT))
+    _guardian.record_speed_test(result, trigger="adhoc")
+    if not result.success:
+        await update.message.reply_text(f"❌ Network quality test failed: {result.error}")
+        return
+    details = [
+        "✅ Network quality test complete",
+        "",
+        f"Download: {result.download_mbps:.1f} Mbps",
+        f"Upload: {result.upload_mbps:.1f} Mbps",
+        f"Latency: {result.latency_ms:.1f} ms" if result.latency_ms is not None else "Latency: unavailable",
+        f"Jitter: {result.jitter_ms:.1f} ms" if result.jitter_ms is not None else "Jitter: unavailable",
+        (
+            f"Packet loss: {result.packet_loss_percent:.1f}%"
+            if result.packet_loss_percent is not None
+            else "Packet loss: unavailable"
+        ),
+        f"Backend: {result.server or 'unknown'}",
+        "",
+        "Recorded as an ad-hoc result; the scheduled 8:30 AM test will still run.",
+    ]
+    await update.message.reply_text("\n".join(details))
+
+
+@_require_auth
+async def net_actions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(_guardian.pending_actions_text())
+
+
+@_require_auth
+async def net_approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /net_approve <action_id>")
+        return
+    await update.message.reply_text(_guardian.decide_action(context.args[0], approve=True))
+
+
+@_require_auth
+async def net_reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /net_reject <action_id>")
+        return
+    await update.message.reply_text(_guardian.decide_action(context.args[0], approve=False))
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -467,9 +599,18 @@ def _make_notify(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 async def _run_smoke_tests() -> tuple[bool, list]:
     from tests.telegram_smoke_tester import run_inprocess
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = int(os.environ.get("SMOKE_CHAT_ID", "0"))
-    return await run_inprocess(chat_id=chat_id, bot_token=token, send_summary=False)
+    bot_module = sys.modules[__name__]
+    raw = await run_inprocess(bot_module)
+    results = [
+        {
+            "command": r.get("spec", ""),
+            "passed": r.get("status") == "PASS",
+            "detail": r.get("reason") or r.get("reply", ""),
+        }
+        for r in raw
+    ]
+    all_passed = all(r["passed"] for r in results)
+    return all_passed, results
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +832,38 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.exception("Unhandled exception", exc_info=context.error)
 
 
+async def _guardian_post_init(application: Application) -> None:
+    """Start the guardian inside the existing Telegram process."""
+    global _guardian_scheduler
+    raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not raw_chat_id:
+        logger.warning("Network Guardian alerts disabled: TELEGRAM_CHAT_ID is not set")
+        return
+    chat_id = int(raw_chat_id)
+
+    async def send(text: str) -> None:
+        await application.bot.send_message(chat_id=chat_id, text=text)
+
+    interval = int(os.getenv("NETWORK_GUARDIAN_SCAN_SECONDS", "300"))
+    _guardian_scheduler = GuardianScheduler(
+        _guardian,
+        send,
+        timezone="Asia/Singapore",
+        scan_interval_seconds=interval,
+        speed_test_runner=_speed_test_runner,
+    )
+    _guardian_scheduler.start()
+    logger.info("Network Guardian started: read-only mode, interval=%ss", interval)
+
+
+async def _guardian_post_shutdown(application: Application) -> None:
+    global _guardian_scheduler
+    if _guardian_scheduler:
+        await _guardian_scheduler.stop()
+        _guardian_scheduler = None
+        logger.info("Network Guardian stopped")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -700,7 +873,13 @@ def main():
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(_guardian_post_init)
+        .post_shutdown(_guardian_post_shutdown)
+        .build()
+    )
 
     app.add_error_handler(error_handler)
 
@@ -717,6 +896,15 @@ def main():
     app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(CommandHandler("whitelist", whitelist_command))
+    app.add_handler(CommandHandler("net_status", net_status_command))
+    app.add_handler(CommandHandler("net_devices", net_devices_command))
+    app.add_handler(CommandHandler("net_scan", net_scan_command))
+    app.add_handler(CommandHandler("net_alerts", net_alerts_command))
+    app.add_handler(CommandHandler("net_summary", net_summary_command))
+    app.add_handler(CommandHandler("net_speed", net_speed_command))
+    app.add_handler(CommandHandler("net_actions", net_actions_command))
+    app.add_handler(CommandHandler("net_approve", net_approve_command))
+    app.add_handler(CommandHandler("net_reject", net_reject_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Group -1: intercepts command-like text when awaiting revision feedback.

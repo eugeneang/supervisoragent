@@ -11,7 +11,9 @@ Covers:
 """
 
 import json
+import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -19,6 +21,7 @@ import pytest
 
 import telegram_bot as tb
 from telegram_bot import (
+    HELP_SECTIONS,
     _parse_ts,
     _window_history,
     _trim_store,
@@ -35,6 +38,18 @@ from telegram_bot import (
     show_id,
     start,
 )
+
+
+def test_help_catalog_covers_every_registered_command():
+    source = (Path(tb.__file__)).read_text(encoding="utf-8")
+    registered = set(re.findall(r'CommandHandler\("([a-z_]+)"', source))
+    documented = {
+        command.split()[0]
+        for _, commands in HELP_SECTIONS
+        for command, _ in commands
+    }
+    assert documented == registered
+
 
 _SGT = ZoneInfo("Asia/Singapore")
 

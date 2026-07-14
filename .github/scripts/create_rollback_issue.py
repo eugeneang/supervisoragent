@@ -7,6 +7,7 @@ import os
 import sys
 import textwrap
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -23,6 +24,8 @@ def main() -> None:
     repo = os.environ["GITHUB_REPOSITORY"]
     token = os.environ["GITHUB_TOKEN"]
     api = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+    if urllib.parse.urlparse(api).scheme != "https":
+        raise SystemExit("GITHUB_API_URL must use HTTPS")
 
     title = f"Auto-rollback failed: could not revert {sha[:7]}"
     fence = "~~~~" if "```" in full_msg else "```"
@@ -57,7 +60,8 @@ def main() -> None:
         },
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        # HTTPS is explicitly enforced before constructing this request.
+        with urllib.request.urlopen(req) as resp:  # nosec B310
             out = json.loads(resp.read().decode())
             print(f"Created issue #{out.get('number')}: {out.get('html_url')}")
     except urllib.error.HTTPError as e:

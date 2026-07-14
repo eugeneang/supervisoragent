@@ -9,9 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +84,7 @@ _TEST_SPECS: list[TestSpec] = [
         description="Daily activity summary",
         handler_attr="recap_handler",
         pattern=re.compile(r"(?s).*Commits.*Supervisor.*Tests Today.*"),
+        needs_auth=True,
     ),
     TestSpec(
         command="/ops",
@@ -103,6 +110,13 @@ _TEST_SPECS: list[TestSpec] = [
         ),
         needs_auth=True,
         timeout=10.0,
+    ),
+    TestSpec(
+        command="/net_status",
+        description="Read-only Network Guardian status",
+        handler_attr="net_status_command",
+        pattern=re.compile(r"Network Guardian", re.IGNORECASE),
+        needs_auth=True,
     ),
 ]
 
@@ -239,16 +253,18 @@ async def run_inprocess(bot_module) -> list[dict]:
 
         if spec.handler_attr == "ai_command":
             _external_patches.append(
-                um.patch(
-                    "agents.ai_news_agent.get_ai_news_digest",
+                um.patch.object(
+                    bot_module,
+                    "get_ai_news_digest",
                     return_value="AI news digest summary: LLM research GPT model",
                 )
             )
 
         if spec.handler_attr == "idea_command":
             _external_patches.append(
-                um.patch(
-                    "commands.idea.generate_idea",
+                um.patch.object(
+                    bot_module,
+                    "generate_idea",
                     new=AsyncMock(
                         return_value=(
                             "💡 *Idea:* Smart News Aggregator\n\n"
@@ -262,17 +278,11 @@ async def run_inprocess(bot_module) -> list[dict]:
             )
 
         if spec.handler_attr == "recap_handler":
-            _external_patches.append(
-                um.patch(
-                    "commands.recap.build_recap",
-                    return_value=(
-                        "📋 *Daily Recap*\n"
-                        "Commits: 3\n"
-                        "Supervisor: IDLE\n"
-                        "Tests Today: 8 passed"
-                    ),
-                )
-            )
+            _external_patches.extend([
+                um.patch("commands.recap._git_commits", return_value="3 commits"),
+                um.patch("commands.recap._supervisor_state", return_value="IDLE"),
+                um.patch("commands.recap._smoke_test_count", return_value="8 passed"),
+            ])
 
         if spec.handler_attr == "ops_handler":
             _external_patches.append(
@@ -329,3 +339,37 @@ async def run_inprocess(bot_module) -> list[dict]:
             })
 
     return results
+
+
+def _format_results(results: list[dict]) -> str:
+    passed = sum(item["status"] == "PASS" for item in results)
+    failed = len(results) - passed
+    lines = [f"Telegram smoke tests: {passed} passed, {failed} failed"]
+    for item in results:
+        detail = item.get("reason", "")
+        lines.append(f"{item['status']}: {item['spec']}{f' — {detail}' if detail else ''}")
+    return "\n".join(lines)
+
+
+async def _main() -> int:
+    import os
+
+    import telegram_bot
+    from telegram import Bot
+
+    results = await run_inprocess(telegram_bot)
+    report = _format_results(results)
+    print(report)
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("SMOKE_CHAT_ID")
+    if token and chat_id and os.getenv("SMOKE_SEND_SUMMARY", "1") != "0":
+        try:
+            async with Bot(token=token) as bot:
+                await bot.send_message(chat_id=int(chat_id), text=report)
+        except Exception as exc:
+            print(f"Smoke summary delivery failed: {exc}", file=sys.stderr)
+    return 0 if all(item["status"] == "PASS" for item in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(_main()))

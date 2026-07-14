@@ -12,6 +12,8 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
+./scripts/quality_gate.sh
+
 MSG_FILE="$(mktemp -t gcommit_msg)"
 cleanup() { rm -f "$MSG_FILE"; }
 trap cleanup EXIT
